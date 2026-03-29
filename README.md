@@ -22,7 +22,7 @@ WARNING: This project was coded largely with the assistance of an LLM. It works 
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/bt-proxy.git /opt/bt-proxy
+git clone https://github.com/denvera/bt-proxy.git /opt/bt-proxy
 cd /opt/bt-proxy
 uv sync
 ```
