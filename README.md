@@ -4,6 +4,8 @@ ESPHome-compatible Bluetooth Proxy for Raspberry Pi.
 
 This implements the ESPHome [Bluetooth Proxy](https://esphome.io/components/bluetooth_proxy/) functionality in Python, allowing a Raspberry Pi to act as a BLE proxy for Home Assistant. It speaks the ESPHome Native API protocol so Home Assistant discovers and uses it exactly like an ESP32-based Bluetooth proxy.
 
+WARNING: This project was coded largely with the assistance of an LLM. It works for me, but your mileage may vary.
+
 ## Features
 
 - **BLE scanning** — passive and active scan modes, raw advertisement forwarding
