@@ -59,6 +59,35 @@ uv run python -m bt_proxy --name living-room-proxy --friendly-name "Living Room 
 
 > **Note:** This uses the ESPHome Native API **plaintext** variant (no encryption). The Noise-encrypted protocol is currently not supported.
 
+## Running with Docker
+
+Pre-built images are available for `amd64`, `arm64`, and `arm/v7` (Raspberry Pi 2+):
+
+```bash
+docker run -d \
+  --name bt-proxy \
+  --restart unless-stopped \
+  --net=host \
+  --privileged \
+  -v /var/run/dbus:/var/run/dbus \
+  ghcr.io/denvera/bt-proxy
+```
+
+Pass any CLI options after the image name:
+
+```bash
+docker run -d \
+  --name bt-proxy \
+  --restart unless-stopped \
+  --net=host \
+  --privileged \
+  -v /var/run/dbus:/var/run/dbus \
+  ghcr.io/denvera/bt-proxy \
+  --name living-room-proxy --friendly-name "Living Room BT Proxy" --log-level DEBUG
+```
+
+> `--net=host` is required for mDNS discovery. `--privileged` grants access to the Bluetooth adapter — alternatively use `--cap-add=NET_ADMIN --cap-add=NET_RAW` with explicit device mounts.
+
 ## Running as a Service
 
 Copy the unit file and enable it:
