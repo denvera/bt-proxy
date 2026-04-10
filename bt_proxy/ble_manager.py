@@ -190,6 +190,9 @@ class BLEConnection:
 
     async def start_notify(self, handle: int) -> None:
         """Enable notifications for a characteristic."""
+        if handle in self._notify_handles:
+            logger.debug("Notifications already active for handle %d", handle)
+            return
         if not self.client:
             raise RuntimeError("Not connected")
         char = _find_char_by_handle(self.client, handle)
