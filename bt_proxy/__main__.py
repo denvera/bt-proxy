@@ -56,19 +56,6 @@ def get_bt_mac(adapter: str | None = None) -> str:
         return "00:00:00:00:00:00"
 
 
-def get_machine_mac() -> str:
-    """Get the machine's primary network MAC address."""
-    try:
-        import uuid as uuid_mod
-
-        mac_int = uuid_mod.getnode()
-        return ":".join(
-            f"{(mac_int >> (8 * (5 - i))) & 0xFF:02X}" for i in range(6)
-        )
-    except Exception:
-        return "00:00:00:00:00:00"
-
-
 async def register_mdns(
     name: str, port: int, mac: str
 ) -> tuple[AsyncZeroconf, AsyncServiceInfo]:
@@ -100,9 +87,7 @@ async def register_mdns(
 async def async_main(args: argparse.Namespace) -> None:
     """Async main entry point."""
     bt_mac = get_bt_mac(args.adapter)
-    machine_mac = get_machine_mac()
     logger.info("Bluetooth MAC: %s", bt_mac)
-    logger.info("Machine MAC: %s", machine_mac)
 
     ble_manager = BLEManager(
         max_connections=args.max_connections,
@@ -113,7 +98,7 @@ async def async_main(args: argparse.Namespace) -> None:
         ble_manager=ble_manager,
         name=args.name,
         friendly_name=args.friendly_name,
-        mac_address=machine_mac,
+        mac_address=bt_mac,
         bt_mac_address=bt_mac,
         port=args.port,
     )
