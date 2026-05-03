@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Default MTU for BLE connections
 DEFAULT_MTU = 23
+MTU_ACQUIRE_TIMEOUT = 10.0
 
 # Connection retry settings
 CONNECT_TIMEOUT = 30.0
@@ -36,6 +37,7 @@ class BLEConnection:
         self.address = address
         self.mac = proto.int_to_mac(address)
         self.client: BleakClient | None = None
+        self._mtu_size = DEFAULT_MTU
         self._on_disconnect = on_disconnect
         self._on_notify = on_notify
         self._notify_handles: set[int] = set()
@@ -46,9 +48,7 @@ class BLEConnection:
 
     @property
     def mtu_size(self) -> int:
-        if self.client is None:
-            return DEFAULT_MTU
-        return getattr(self.client, "mtu_size", DEFAULT_MTU)
+        return self._mtu_size
 
     def _disconnected_callback(self, client: BleakClient) -> None:
         logger.info("Device %s disconnected", self.mac)
@@ -69,7 +69,25 @@ class BLEConnection:
             timeout=CONNECT_TIMEOUT,
         )
         await self.client.connect()
+        await self._acquire_mtu()
         logger.info("Connected to %s (MTU=%d)", self.mac, self.mtu_size)
+
+    async def _acquire_mtu(self) -> None:
+        """Ask Bleak/BlueZ to negotiate and cache the ATT MTU."""
+        if not self.client:
+            return
+
+        backend = getattr(self.client, "_backend", self.client)
+        acquire_mtu = getattr(backend, "_acquire_mtu", None)
+        if acquire_mtu is not None:
+            try:
+                await asyncio.wait_for(acquire_mtu(), timeout=MTU_ACQUIRE_TIMEOUT)
+            except Exception as e:
+                logger.warning("Failed to acquire MTU for %s: %s", self.mac, e)
+
+        mtu_size = getattr(backend, "_mtu_size", None)
+        if isinstance(mtu_size, int) and mtu_size >= DEFAULT_MTU:
+            self._mtu_size = mtu_size
 
     async def disconnect(self) -> None:
         """Disconnect from the BLE device."""
