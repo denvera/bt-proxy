@@ -12,6 +12,7 @@ import subprocess
 from zeroconf import IPVersion
 from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 
+from . import EMULATED_ESPHOME_VERSION
 from .api_server import APIServer
 from .ble_manager import BLEManager
 
@@ -70,7 +71,7 @@ async def register_mdns(
         addresses=[socket.inet_aton(local_ip)],
         port=port,
         properties={
-            "version": "1.0",
+            "version": EMULATED_ESPHOME_VERSION,
             "mac": mac.replace(":", "").lower(),
             "platform": "linux",
             "network": "wifi",

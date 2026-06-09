@@ -7,9 +7,19 @@ import logging
 from typing import Any, Callable
 
 from bleak import BleakClient, BleakScanner
+from bleak.assigned_numbers import AdvertisementDataType
+from bleak.backends.bluezdbus.version import _get_bluetoothctl_version
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+
+try:  # bleak >= 1.0 exposes these from bleak.args.bluez
+    from bleak.args.bluez import BlueZScannerArgs, OrPattern
+except ImportError:  # pragma: no cover - older bleak layout
+    from bleak.backends.bluezdbus.scanner import BlueZScannerArgs  # type: ignore
+    from bleak.backends.bluezdbus.advertisement_monitor import (  # type: ignore
+        OrPattern,
+    )
 
 from . import proto
 
@@ -23,6 +33,21 @@ MTU_ACQUIRE_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 30.0
 CONNECT_RETRY_DELAY = 2.0
 CONNECT_MAX_RETRIES = 3
+
+# Passive scanning via the BlueZ AdvertisementMonitor1 D-Bus interface needs
+# BlueZ >= 5.56 (and the daemon started with --experimental). On older BlueZ
+# we must not even attempt it. See:
+# https://github.com/hbldh/bleak/commit/2d70d1c0727b1319d57effac36c70c1c891e51e9
+PASSIVE_MIN_BLUEZ_VERSION = (5, 56)
+
+# BlueZ passive scanning requires "or_patterns"; without them bleak raises.
+# Matching the advertising FLAGS field (LE General / Limited Discoverable)
+# captures effectively all connectable advertisements, mirroring what Home
+# Assistant's own habluetooth passive scanner uses.
+PASSIVE_SCAN_OR_PATTERNS = [
+    OrPattern(0, AdvertisementDataType.FLAGS, b"\x06"),
+    OrPattern(0, AdvertisementDataType.FLAGS, b"\x1a"),
+]
 
 
 class BLEConnection:
@@ -269,7 +294,16 @@ class BLEManager:
         self._connections: dict[int, BLEConnection] = {}
         self._connecting: set[int] = set()
         self._scanner: BleakScanner | None = None
+        # Mode requested by the client (Home Assistant).
         self._scan_active = True
+        # Mode actually in use; falls back to active when passive scanning
+        # is requested but unavailable on this BlueZ stack.
+        self._effective_scan_active = True
+        # Passive-scan capability is probed once and cached for the process
+        # lifetime: once ruled out (old BlueZ, or a runtime failure such as
+        # the daemon not running with --experimental) we stop attempting it.
+        self._passive_checked = False
+        self._passive_unavailable = False
         self._scanning = False
         self._adv_callback: Callable[
             [int, int, int, bytes], None
@@ -329,27 +363,108 @@ class BLEManager:
         self._adv_callback(address_int, rssi, address_type, raw_data)
 
     async def start_scanning(self) -> None:
-        """Start BLE scanning."""
+        """Start BLE scanning.
+
+        Honours the client-requested mode, but only runs passive scanning if
+        BlueZ supports it. If a requested passive scan can't be started it
+        falls back to active scanning for the rest of the process.
+        """
         if self._scanning:
             return
 
-        logger.info("Starting BLE scanner (active=%s)", self._scan_active)
+        use_passive = (
+            not self._scan_active and await self._passive_scan_available()
+        )
+        self._effective_scan_active = not use_passive
+
+        configured = "active" if self._scan_active else "passive"
+        effective = "active" if self._effective_scan_active else "passive"
+        logger.info(
+            f"Starting BLE scanner (configured={configured}, mode={effective})"
+        )
         if self._scanner_state_callback:
             self._scanner_state_callback(proto.SCANNER_STATE_STARTING)
 
+        if use_passive:
+            try:
+                await self._start_scanner(passive=True)
+            except Exception as e:
+                # Passive failed at runtime (e.g. BlueZ not started with
+                # --experimental). Fall back to active scanning. If active
+                # also fails the problem isn't passive-specific (e.g. the
+                # adapter is powered off), so let it propagate and leave
+                # passive enabled for a later retry rather than permanently
+                # disabling it.
+                logger.warning(
+                    f"Passive scanning failed to start ({e}); "
+                    f"falling back to active scanning"
+                )
+                await self._start_scanner(passive=False)
+                # Active works but passive doesn't: don't attempt passive
+                # again for the rest of the process.
+                self._passive_unavailable = True
+                self._effective_scan_active = True
+        else:
+            await self._start_scanner(passive=False)
+
+        self._scanning = True
+
+        if self._scanner_state_callback:
+            self._scanner_state_callback(proto.SCANNER_STATE_RUNNING)
+
+    async def _start_scanner(self, passive: bool) -> None:
+        """Create and start a BleakScanner in the given mode."""
         kwargs: dict[str, Any] = {
             "detection_callback": self._detection_callback,
-            "scanning_mode": "active" if self._scan_active else "passive",
+            "scanning_mode": "passive" if passive else "active",
         }
+        if passive:
+            kwargs["bluez"] = BlueZScannerArgs(
+                or_patterns=PASSIVE_SCAN_OR_PATTERNS
+            )
         if self._adapter:
             kwargs["adapter"] = self._adapter
 
         self._scanner = BleakScanner(**kwargs)
         await self._scanner.start()
-        self._scanning = True
 
-        if self._scanner_state_callback:
-            self._scanner_state_callback(proto.SCANNER_STATE_RUNNING)
+    async def _passive_scan_available(self) -> bool:
+        """Whether a passive scan may be attempted on this BlueZ stack.
+
+        The BlueZ version is probed only once per process; a negative result
+        (old BlueZ, or a previous runtime failure) is cached so we don't keep
+        retrying something that can't work.
+        """
+        if self._passive_unavailable:
+            return False
+        if not self._passive_checked:
+            self._passive_checked = True
+            if not await self._bluez_supports_passive():
+                self._passive_unavailable = True
+                return False
+        return True
+
+    async def _bluez_supports_passive(self) -> bool:
+        """Check bluetoothd/BlueZ is new enough for passive scanning."""
+        version = await _get_bluetoothctl_version()
+        if version is None:
+            # bluetoothctl unavailable (e.g. a container with only the D-Bus
+            # API). Optimistically attempt passive and rely on the runtime
+            # failover if it turns out not to work.
+            logger.warning(
+                "Could not determine BlueZ version; "
+                "will attempt passive scanning"
+            )
+            return True
+        major, minor = (int(g) for g in version.groups())
+        if (major, minor) < PASSIVE_MIN_BLUEZ_VERSION:
+            need_major, need_minor = PASSIVE_MIN_BLUEZ_VERSION
+            logger.info(
+                f"BlueZ {major}.{minor} does not support passive scanning "
+                f"(need >= {need_major}.{need_minor}); using active scanning"
+            )
+            return False
+        return True
 
     async def stop_scanning(self) -> None:
         """Stop BLE scanning."""

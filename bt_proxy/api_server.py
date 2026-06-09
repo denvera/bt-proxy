@@ -7,7 +7,7 @@ import logging
 import time
 from typing import Any
 
-from . import proto
+from . import EMULATED_ESPHOME_VERSION, proto
 from .ble_manager import BLEManager
 
 logger = logging.getLogger(__name__)
@@ -158,7 +158,7 @@ class APIConnection:
         resp = proto.encode_device_info_response(
             name=self.server.name,
             mac_address=self.server.mac_address,
-            esphome_version="2025.11.0",
+            esphome_version=EMULATED_ESPHOME_VERSION,
             model="Raspberry Pi BT Proxy",
             manufacturer="bt-proxy",
             friendly_name=self.server.friendly_name,
@@ -196,17 +196,15 @@ class APIConnection:
 
         # Send current scanner state
         ble = self.server.ble_manager
-        mode = (
-            proto.SCANNER_MODE_ACTIVE
-            if ble._scan_active
-            else proto.SCANNER_MODE_PASSIVE
-        )
+        current_mode, configured_mode = self._scanner_mode_fields()
         state = (
             proto.SCANNER_STATE_RUNNING
             if ble._scanning
             else proto.SCANNER_STATE_IDLE
         )
-        resp = proto.encode_ble_scanner_state_response(state, mode, mode)
+        resp = proto.encode_ble_scanner_state_response(
+            state, current_mode, configured_mode
+        )
         self._send_message(proto.MSG_BLE_SCANNER_STATE_RESPONSE, resp)
 
     async def _handle_unsubscribe_ble_advertisements(
@@ -462,14 +460,30 @@ class APIConnection:
 
     def push_scanner_state(self, state: int) -> None:
         """Send scanner state update to client."""
+        current_mode, configured_mode = self._scanner_mode_fields()
+        resp = proto.encode_ble_scanner_state_response(
+            state, current_mode, configured_mode
+        )
+        self._send_message(proto.MSG_BLE_SCANNER_STATE_RESPONSE, resp)
+
+    def _scanner_mode_fields(self) -> tuple[int, int]:
+        """Return (current_mode, configured_mode) for scanner state messages.
+
+        ``current_mode`` is the mode actually in use (passive may fall back to
+        active), while ``configured_mode`` is what the client requested.
+        """
         ble = self.server.ble_manager
-        mode = (
+        current_mode = (
+            proto.SCANNER_MODE_ACTIVE
+            if ble._effective_scan_active
+            else proto.SCANNER_MODE_PASSIVE
+        )
+        configured_mode = (
             proto.SCANNER_MODE_ACTIVE
             if ble._scan_active
             else proto.SCANNER_MODE_PASSIVE
         )
-        resp = proto.encode_ble_scanner_state_response(state, mode, mode)
-        self._send_message(proto.MSG_BLE_SCANNER_STATE_RESPONSE, resp)
+        return current_mode, configured_mode
 
     # ------------------------------------------------------------------
     # Internal helpers
