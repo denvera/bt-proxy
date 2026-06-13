@@ -34,6 +34,17 @@ CONNECT_TIMEOUT = 30.0
 CONNECT_RETRY_DELAY = 2.0
 CONNECT_MAX_RETRIES = 3
 
+# Scanner start can fail transiently — most commonly BlueZ "InProgress" when a
+# previous discovery session hasn't been torn down yet. We retry instead of
+# letting the exception crash the process: an unhandled failure here exits the
+# app, and under a supervisor (Docker `--restart`, systemd) that becomes a
+# tight restart-loop that hammers an already-flaky adapter.
+SCAN_START_MAX_RETRIES = 5
+SCAN_START_RETRY_DELAY = 3.0
+# After exhausting the inline retries we keep trying in the background at this
+# cadence so the scanner self-heals once the adapter recovers.
+SCAN_RETRY_INTERVAL = 10.0
+
 # Passive scanning via the BlueZ AdvertisementMonitor1 D-Bus interface needs
 # BlueZ >= 5.56 (and the daemon started with --experimental). On older BlueZ
 # we must not even attempt it. See:
@@ -305,6 +316,8 @@ class BLEManager:
         self._passive_checked = False
         self._passive_unavailable = False
         self._scanning = False
+        # Background task that retries scanner start after a terminal failure.
+        self._scan_retry_task: asyncio.Task | None = None
         self._adv_callback: Callable[
             [int, int, int, bytes], None
         ] | None = None
@@ -368,6 +381,12 @@ class BLEManager:
         Honours the client-requested mode, but only runs passive scanning if
         BlueZ supports it. If a requested passive scan can't be started it
         falls back to active scanning for the rest of the process.
+
+        Scanner start is made resilient: BlueZ can transiently reject it (e.g.
+        ``InProgress`` while a prior discovery session is torn down), so we
+        retry rather than let the exception crash the process. If it still
+        can't start we report FAILED and keep retrying in the background, so
+        the proxy stays up and self-heals once the adapter recovers.
         """
         if self._scanning:
             return
@@ -385,30 +404,50 @@ class BLEManager:
         if self._scanner_state_callback:
             self._scanner_state_callback(proto.SCANNER_STATE_STARTING)
 
-        if use_passive:
-            try:
-                await self._start_scanner(passive=True)
-            except Exception as e:
-                # Passive failed at runtime (e.g. BlueZ not started with
-                # --experimental). Fall back to active scanning. If active
-                # also fails the problem isn't passive-specific (e.g. the
-                # adapter is powered off), so let it propagate and leave
-                # passive enabled for a later retry rather than permanently
-                # disabling it.
-                logger.warning(
-                    f"Passive scanning failed to start ({e}); "
-                    f"falling back to active scanning"
-                )
-                await self._start_scanner(passive=False)
-                # Active works but passive doesn't: don't attempt passive
-                # again for the rest of the process.
-                self._passive_unavailable = True
-                self._effective_scan_active = True
-        else:
-            await self._start_scanner(passive=False)
+        try:
+            if use_passive:
+                try:
+                    await self._start_scanner(passive=True)
+                except Exception as e:
+                    # Passive failed at runtime (e.g. BlueZ not started with
+                    # --experimental). Fall back to active scanning. If active
+                    # also fails the problem isn't passive-specific (e.g. the
+                    # adapter is powered off), so leave passive enabled for a
+                    # later retry rather than permanently disabling it.
+                    logger.warning(
+                        f"Passive scanning failed to start ({e}); "
+                        f"falling back to active scanning"
+                    )
+                    await self._start_scanner_resilient(passive=False)
+                    # Active works but passive doesn't: don't attempt passive
+                    # again for the rest of the process.
+                    self._passive_unavailable = True
+                    self._effective_scan_active = True
+            else:
+                await self._start_scanner_resilient(passive=False)
+        except Exception as e:
+            # Couldn't start even after retries. Stay alive — crashing here
+            # would restart-loop under a supervisor and hammer the adapter —
+            # and keep retrying in the background. Surface a hint: persistent
+            # failures (esp. BlueZ "InProgress") usually mean the controller
+            # is wedged and needs an HCI-level reset.
+            adapter = self._adapter or "hci0"
+            logger.error(
+                f"Failed to start BLE scanner after "
+                f"{SCAN_START_MAX_RETRIES} attempts: {e}. The Bluetooth "
+                f"adapter may be wedged; an HCI-level reset usually clears it, "
+                f"e.g. 'sudo hciconfig {adapter} reset' (or 'sudo hciconfig "
+                f"{adapter} down && sudo hciconfig {adapter} up', or reboot). "
+                f"Restarting bluetoothd alone is not enough. Will keep retrying "
+                f"every {int(SCAN_RETRY_INTERVAL)}s."
+            )
+            self._scanning = False
+            if self._scanner_state_callback:
+                self._scanner_state_callback(proto.SCANNER_STATE_FAILED)
+            self._schedule_scan_retry()
+            return
 
         self._scanning = True
-
         if self._scanner_state_callback:
             self._scanner_state_callback(proto.SCANNER_STATE_RUNNING)
 
@@ -427,6 +466,69 @@ class BLEManager:
 
         self._scanner = BleakScanner(**kwargs)
         await self._scanner.start()
+
+    async def _start_scanner_resilient(self, passive: bool) -> None:
+        """Start the scanner, retrying through transient BlueZ errors.
+
+        Raises the last error if it still can't start after the retry budget.
+        """
+        last_error: Exception | None = None
+        for attempt in range(1, SCAN_START_MAX_RETRIES + 1):
+            try:
+                await self._start_scanner(passive=passive)
+                return
+            except Exception as e:
+                last_error = e
+                if attempt >= SCAN_START_MAX_RETRIES:
+                    break
+                logger.warning(
+                    f"BLE scanner start attempt "
+                    f"{attempt}/{SCAN_START_MAX_RETRIES} failed ({e}); "
+                    f"recovering and retrying"
+                )
+                await self._recover_scanner_state(e)
+                await asyncio.sleep(SCAN_START_RETRY_DELAY)
+        assert last_error is not None
+        raise last_error
+
+    async def _recover_scanner_state(self, error: Exception) -> None:
+        """Best-effort cleanup before retrying a failed scanner start."""
+        if "InProgress" in str(error):
+            # A previous discovery session may not be torn down yet; ask BlueZ
+            # to stop discovery so the retry can start cleanly. The backoff
+            # also gives BlueZ time to release a dead client's session.
+            await self._bluez_stop_discovery()
+
+    async def _bluez_stop_discovery(self) -> None:
+        """Best-effort: tell BlueZ to stop any in-progress discovery."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "bluetoothctl", "scan", "off",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except Exception:
+            pass
+
+    def _schedule_scan_retry(self) -> None:
+        """Ensure a single background task is retrying the scanner start."""
+        if self._scan_retry_task is None or self._scan_retry_task.done():
+            self._scan_retry_task = asyncio.ensure_future(
+                self._scan_retry_loop()
+            )
+
+    async def _scan_retry_loop(self) -> None:
+        """Keep retrying scanner start until it succeeds (self-heal)."""
+        try:
+            while not self._scanning:
+                await asyncio.sleep(SCAN_RETRY_INTERVAL)
+                if self._scanning:
+                    break
+                logger.info("Retrying BLE scanner start after earlier failure")
+                await self.start_scanning()
+        finally:
+            self._scan_retry_task = None
 
     async def _passive_scan_available(self) -> bool:
         """Whether a passive scan may be attempted on this BlueZ stack.
@@ -639,6 +741,9 @@ class BLEManager:
 
     async def cleanup(self) -> None:
         """Clean up all connections and stop scanning."""
+        if self._scan_retry_task is not None:
+            self._scan_retry_task.cancel()
+            self._scan_retry_task = None
         for conn in list(self._connections.values()):
             try:
                 await conn.disconnect()
