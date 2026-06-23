@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable
 
 from bleak import BleakClient, BleakScanner
 from bleak.assigned_numbers import AdvertisementDataType
+from bleak.exc import BleakError
 from bleak.backends.bluezdbus.version import _get_bluetoothctl_version
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
@@ -33,6 +35,20 @@ MTU_ACQUIRE_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 30.0
 CONNECT_RETRY_DELAY = 2.0
 CONNECT_MAX_RETRIES = 3
+
+# Per-device connect-failure backoff. Home Assistant retries failed connections
+# aggressively; without a brake we relay every retry straight to BlueZ and the
+# controller, and that churn can tip a flaky single-radio adapter over the edge
+# (it's what triggered a bluetoothd wedge in testing). Each consecutive failure
+# pushes the next allowed attempt out (linear, capped); a success clears it.
+CONNECT_FAIL_BACKOFF_STEP = 5.0
+CONNECT_FAIL_BACKOFF_MAX = 60.0
+# A connect that "succeeds" instantly but isn't really connected (a phantom
+# connection — BlueZ returns success yet the link is dead, MTU acquire reports
+# "Not connected"), or D-Bus calls returning NoReply, means bluetoothd itself
+# is wedged. The proxy can't fix that (it's a host daemon), so we back off hard
+# and log how to recover rather than flapping every reconnect.
+DAEMON_WEDGE_BACKOFF = 120.0
 
 # Scanner start can fail transiently — most commonly BlueZ "InProgress" when a
 # previous discovery session hasn't been fully torn down yet. We make a few
@@ -63,6 +79,31 @@ PASSIVE_SCAN_OR_PATTERNS = [
     OrPattern(0, AdvertisementDataType.FLAGS, b"\x06"),
     OrPattern(0, AdvertisementDataType.FLAGS, b"\x1a"),
 ]
+
+
+def _is_link_dead_error(error: Exception) -> bool:
+    """Whether an exception means the BLE link is actually dead.
+
+    Distinguishes a real disconnect / wedged-daemon condition from a benign
+    transient: "Not connected" and D-Bus "NoReply" mean the link is gone (or
+    bluetoothd is wedged holding stale state), as opposed to e.g. a slow MTU
+    negotiation that shouldn't fail an otherwise good connection.
+    """
+    err = str(error)
+    return "Not connected" in err or "NoReply" in err
+
+
+def _is_daemon_wedge_error(error: Exception | None) -> bool:
+    """Whether a connect failure looks like a wedged bluetoothd daemon.
+
+    The tells are a phantom connection (BlueZ claims success but the link is
+    dead) or D-Bus calls timing out with NoReply — neither is fixable from the
+    proxy, so we treat them specially (hard backoff + a recovery hint).
+    """
+    if error is None:
+        return False
+    err = str(error)
+    return "phantom" in err or "NoReply" in err or "Not connected" in err
 
 
 class BLEConnection:
@@ -110,6 +151,16 @@ class BLEConnection:
         )
         await self.client.connect()
         await self._acquire_mtu()
+        # A genuine connection is actually connected once connect() returns.
+        # If BlueZ reports success but the link isn't really up (a phantom
+        # connection — typically when bluetoothd is wedged and holding stale
+        # state), treat it as a failure so the caller backs off instead of
+        # "succeeding" with a dead handle that fails every subsequent GATT op.
+        if not self.client.is_connected:
+            raise BleakError(
+                f"phantom connection to {self.mac}: BlueZ reported success "
+                f"but the device is not connected"
+            )
         logger.info("Connected to %s (MTU=%d)", self.mac, self.mtu_size)
 
     async def _acquire_mtu(self) -> None:
@@ -123,6 +174,12 @@ class BLEConnection:
             try:
                 await asyncio.wait_for(acquire_mtu(), timeout=MTU_ACQUIRE_TIMEOUT)
             except Exception as e:
+                # MTU acquire is best-effort and a hiccup shouldn't fail a good
+                # connection — but "Not connected"/"NoReply" here means the link
+                # is actually dead (phantom connection / wedged daemon), so let
+                # it propagate to fail the connect rather than report MTU=23.
+                if _is_link_dead_error(e):
+                    raise
                 logger.warning("Failed to acquire MTU for %s: %s", self.mac, e)
 
         mtu_size = getattr(backend, "_mtu_size", None)
@@ -308,6 +365,12 @@ class BLEManager:
         self._adapter = adapter
         self._connections: dict[int, BLEConnection] = {}
         self._connecting: set[int] = set()
+        # Per-device connect-failure backoff: address -> (fail_count, next_ts).
+        # Throttles reconnect storms so we don't hammer a flaky controller.
+        self._connect_backoff: dict[int, tuple[int, float]] = {}
+        # Latch so the "bluetoothd is wedged" recovery hint is logged once per
+        # episode, not on every flapping reconnect.
+        self._daemon_wedge_logged = False
         self._scanner: BleakScanner | None = None
         # Mode requested by the client (Home Assistant).
         self._scan_active = True
@@ -320,11 +383,6 @@ class BLEManager:
         self._passive_checked = False
         self._passive_unavailable = False
         self._scanning = False
-        # Active scanning and a held GATT connection can't safely coexist on a
-        # single-radio adapter (the Pi's onboard BT) — sustained coexistence
-        # wedges the controller. While a connection is held we suspend active
-        # scanning and set this flag so it's resumed once everything is idle.
-        self._scan_suspended_for_conn = False
         # Background task that slowly re-arms the scanner after a failed start.
         self._scan_rearm_task: asyncio.Task | None = None
         self._adv_callback: Callable[
@@ -391,12 +449,10 @@ class BLEManager:
         BlueZ supports it. If a requested passive scan can't be started it
         falls back to active scanning for the rest of the process.
 
-        Active scanning is deferred while a GATT connection is held: on a
-        single-radio adapter the two can't coexist without eventually wedging
-        the controller, so scanning resumes only once all connections close.
-        Passive scanning (RX-only) contends far less and is left to run.
-        Start is retried a few times for transient BlueZ errors but never
-        hammered — see the module constants.
+        The scanner is long-lived: it keeps running across GATT connections
+        (BlueZ time-slices discovery and connections on a single radio just
+        fine — that's the normal proxy behaviour). Start is retried a few times
+        for transient BlueZ errors but never hammered — see the constants.
         """
         if self._scanning:
             return
@@ -405,19 +461,6 @@ class BLEManager:
             not self._scan_active and await self._passive_scan_available()
         )
         self._effective_scan_active = not use_passive
-
-        # Don't start active scanning while a connection is held — defer it.
-        if self._effective_scan_active and (
-            self._connections or self._connecting
-        ):
-            self._scan_suspended_for_conn = True
-            logger.info(
-                f"Deferring active BLE scan: "
-                f"{len(self._connections)} connection(s) held"
-            )
-            if self._scanner_state_callback:
-                self._scanner_state_callback(proto.SCANNER_STATE_STOPPED)
-            return
 
         configured = "active" if self._scan_active else "passive"
         effective = "active" if self._effective_scan_active else "passive"
@@ -624,42 +667,60 @@ class BLEManager:
     def _handle_disconnect(self, address: int) -> None:
         """Internal disconnect handler."""
         conn = self._connections.pop(address, None)
+        if conn:
+            # Schedule BlueZ cleanup in background
+            asyncio.ensure_future(self._bluez_clear_state(conn.mac))
         if self._disconnect_callback:
             self._disconnect_callback(address)
-        # Clear BlueZ state then, if nothing is left connected, resume scanning.
-        asyncio.ensure_future(self._post_disconnect(conn))
-
-    async def _post_disconnect(self, conn: BLEConnection | None) -> None:
-        """Best-effort BlueZ cleanup after a disconnect, then resume scanning."""
-        if conn:
-            await self._bluez_clear_state(conn.mac)
-        await self._resume_scanning_if_idle()
-
-    async def _resume_scanning_if_idle(self) -> None:
-        """Restart a connection-suspended scanner once nothing is connected."""
-        if (
-            self._scan_suspended_for_conn
-            and not self._connections
-            and not self._connecting
-        ):
-            self._scan_suspended_for_conn = False
-            await self.start_scanning()
 
     def _handle_notify(self, address: int, handle: int, data: bytes) -> None:
         """Internal notification handler."""
         if self._notify_callback:
             self._notify_callback(address, handle, data)
 
+    def _connect_backoff_remaining(self, address: int) -> float:
+        """Seconds left before another connect to this device is allowed."""
+        _, next_ts = self._connect_backoff.get(address, (0, 0.0))
+        return max(0.0, next_ts - time.monotonic())
+
+    def _note_connect_failure(
+        self, address: int, mac: str, error: Exception | None
+    ) -> None:
+        """Log a failed connect and extend this device's backoff window."""
+        fails = self._connect_backoff.get(address, (0, 0.0))[0] + 1
+
+        if _is_daemon_wedge_error(error):
+            # Not fixable from here — bluetoothd needs restarting on the host.
+            # Back off hard and say so once, instead of flapping every retry.
+            delay = DAEMON_WEDGE_BACKOFF
+            if not self._daemon_wedge_logged:
+                self._daemon_wedge_logged = True
+                adapter = self._adapter or "hci0"
+                logger.error(
+                    f"Connect to {mac} is failing like bluetoothd is wedged "
+                    f"(phantom connection / no D-Bus reply). This usually needs "
+                    f"the daemon restarted on the host: 'sudo systemctl restart "
+                    f"bluetooth' (if that doesn't help, also reset the adapter: "
+                    f"'sudo hciconfig {adapter} reset'). Backing off "
+                    f"{int(delay)}s between attempts until it recovers."
+                )
+        else:
+            delay = min(CONNECT_FAIL_BACKOFF_MAX, CONNECT_FAIL_BACKOFF_STEP * fails)
+
+        self._connect_backoff[address] = (fails, time.monotonic() + delay)
+        logger.error(
+            f"Failed to connect to {mac} after {CONNECT_MAX_RETRIES} attempts: "
+            f"{error} (next attempt blocked for {int(delay)}s)"
+        )
+
     async def connect_device(self, address: int) -> tuple[bool, int, int]:
         """Connect to a BLE device.
 
         Returns (success, mtu, error_code).
 
-        Active scanning is suspended for the lifetime of the connection (it
-        can't safely coexist with a held connection on a single-radio adapter)
-        and resumed once all connections close. We deliberately do NOT toggle
-        the scanner per attempt within a connect — only once, around the held
-        connection.
+        Scanning is left running throughout — BlueZ interleaves discovery and
+        connection establishment itself, so there's no need to stop the scanner
+        (and toggling it per connect just churns the adapter).
         """
         if len(self._connections) >= self.max_connections:
             logger.warning("No free connection slots")
@@ -678,19 +739,22 @@ class BLEManager:
             return False, 0, -1
 
         mac = proto.int_to_mac(address)
+
+        # Honour the per-device backoff: if recent connects keep failing, don't
+        # relay Home Assistant's retries to the controller — that churn is what
+        # tips a flaky adapter into a wedge. Fail fast until the window expires.
+        remaining = self._connect_backoff_remaining(address)
+        if remaining > 0:
+            logger.debug(
+                "Backing off connect to %s (%.0fs remaining)", mac, remaining
+            )
+            return False, 0, -1
+
         self._connecting.add(address)
 
         try:
             # Look up cached BLEDevice from scanner
             ble_device = self._device_cache.get(mac.upper())
-
-            # Free the radio for the connection and keep it free for the
-            # connection's lifetime: active scanning concurrent with a held
-            # connection wedges single-radio adapters. Resumed once idle in
-            # _resume_scanning_if_idle().
-            if self._scanning and self._effective_scan_active:
-                self._scan_suspended_for_conn = True
-                await self.stop_scanning()
 
             conn = BLEConnection(
                 address, self._handle_disconnect, self._handle_notify
@@ -701,6 +765,9 @@ class BLEManager:
             for attempt in range(1, CONNECT_MAX_RETRIES + 1):
                 try:
                     await conn.connect(ble_device)
+                    # Success clears any backoff and the wedge latch.
+                    self._connect_backoff.pop(address, None)
+                    self._daemon_wedge_logged = False
                     return True, conn.mtu_size, 0
                 except Exception as e:
                     last_error = e
@@ -714,6 +781,11 @@ class BLEManager:
                     )
                     if attempt >= CONNECT_MAX_RETRIES:
                         break
+                    if _is_daemon_wedge_error(e):
+                        # Retrying a wedged daemon just churns (and bluetoothctl
+                        # cleanup would hang on NoReply); stop and let the hard
+                        # backoff in _note_connect_failure take over.
+                        break
                     if "InProgress" in err_str:
                         # BlueZ still has stale state for this device — clear it
                         # and let the always-on scanner re-populate the cache.
@@ -726,21 +798,12 @@ class BLEManager:
                     if ble_device is None:
                         ble_device = self._device_cache.get(mac.upper())
 
-            # All retries exhausted
-            logger.error(
-                "Failed to connect to %s after %d attempts: %s",
-                mac,
-                CONNECT_MAX_RETRIES,
-                last_error,
-            )
+            # All retries exhausted — record the failure and arm the backoff.
+            self._note_connect_failure(address, mac, last_error)
             self._connections.pop(address, None)
             return False, 0, -1
         finally:
             self._connecting.discard(address)
-            # If the connect failed and nothing else is connected, bring the
-            # scanner back. (On success the connection is held, so this is a
-            # no-op and scanning stays suspended until disconnect.)
-            await self._resume_scanning_if_idle()
 
     async def _bluez_clear_state(self, mac: str) -> None:
         """Disconnect a device in BlueZ to clear stale connection state."""
@@ -774,8 +837,6 @@ class BLEManager:
             await conn.disconnect()
             # Also clear BlueZ state to prevent InProgress on next connect
             await self._bluez_clear_state(conn.mac)
-        # Resume scanning if this was the last connection.
-        await self._resume_scanning_if_idle()
 
     def get_connection(self, address: int) -> BLEConnection | None:
         """Get an active connection by address."""

@@ -105,6 +105,86 @@ sudo systemctl status bt-proxy
 journalctl -u bt-proxy -f
 ```
 
+## Reliability on Raspberry Pi
+
+Undervolting or brownout/undervoltage conditions on Pi's produce exactly the 
+symptoms that look like flaky bluetooth, often manifested as HCI command timeouts (`dmesg`: `hci0: Opcode 0x200c failed`,
+`tx timeout`), `Frame reassembly failed`, dropped connections, even an unresponsive `bluetoothd`.
+
+**Before blaming bluetooth, check power:**
+
+```bash
+vcgencmd get_throttled      # want 0x0 (or at most 0x50000 = a brief boot-time
+                            # dip); a non-zero bit 0 means under-voltage NOW
+```
+
+Use a proper **5.1 V / ≥2.5 A** supply and a short, thick cable. Undervoltage
+under load (`0x...1` / `0x...5`) is the most common cause of "random" BT
+failures on a Pi.
+
+The proxy also **backs off** instead of hammering the adapter when connections
+keep failing, which both protects a flaky controller and keeps the logs
+readable.
+
+### When bluetooth appears unresponsive
+
+Two distinct failures can occur on the onboard radio, with different fixes:
+
+- **Controller unresponsive** — `dmesg` shows `hci0: Opcode 0x200c failed: -110/-16`.
+  Restarting `bluetoothd` is *not* enough; reset the adapter:
+  ```bash
+  sudo hciconfig hci0 reset    # or: down && up, or reboot
+  ```
+- **Daemon unresponsive** — the proxy logs that it looks like *"bluetoothd is wedged
+  (phantom connection / no D-Bus reply)"*. Here the **daemon** needs a restart
+  (an adapter reset alone won't fix it, and neither will restarting bt-proxy):
+  ```bash
+  sudo systemctl restart bluetooth
+  ```
+
+bt-proxy tries to detect these conditions, log a recovery hint, and back off so it
+recovers once the underlying issue clears — but it wont 
+reset the adapter or restart `bluetoothd` itself (those are host-level actions).
+
+### Optional: auto-recover an unresponsive `bluetoothd` (watchdog)
+
+If you want an automatic, albeit somewhat primitive  recovery from the unresponsive daemon
+ case, add a small systemd watchdog on the **host** that restarts `bluetooth` when the proxy reports it's
+frozen. For example, a timer that restarts the daemon when the marker shows up
+in the proxy's logs:
+
+```ini
+# /etc/systemd/system/bt-proxy-watchdog.service
+[Unit]
+Description=Restart bluetoothd if unresponsive
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'journalctl -u bt-proxy --since "-3min" | grep -q "bluetoothd is wedged" && systemctl restart bluetooth || true'
+```
+
+```ini
+# /etc/systemd/system/bt-proxy-watchdog.timer
+[Unit]
+Description=Periodically check whether bluetoothd needs restarting
+
+[Timer]
+OnUnitActiveSec=2min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now bt-proxy-watchdog.timer
+```
+
+> Adjust the `journalctl -u` unit name (and add `-t`/container filters) to match
+> how you run the proxy. Under Docker, point it at the container logs instead,
+> e.g. `docker logs --since 3m bt-proxy 2>&1 | grep -q ...`.
+
 ## Architecture
 
 ```
