@@ -598,10 +598,14 @@ class APIServer:
         """Stop the server and close all connections."""
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
         for conn in list(self._connections):
             await conn._cleanup()
         self._connections.clear()
+        if self._server:
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Timed out waiting for API server to close")
 
     def remove_connection(self, conn: APIConnection) -> None:
         """Remove a connection from the active list."""
