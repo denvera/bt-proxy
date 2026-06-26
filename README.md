@@ -105,6 +105,55 @@ sudo systemctl status bt-proxy
 journalctl -u bt-proxy -f
 ```
 
+## Scanning modes: active vs passive
+
+Home Assistant requests **passive** scanning by default. bt-proxy honours
+that when BlueZ supports it, and otherwise falls back to **active** scanning
+automatically — so things keep working either way. If passive isn't available
+you'll see a one-off warning in the log followed by `falling back to active
+scanning`; that's harmless.
+
+Passive is generally the better default. It's lighter-weight on the proxy itself
+(the radio only listens, never transmits, which also reduces RF congestion when
+several proxies are around), and it can be gentler on some battery sensors:
+
+- **Active** scanning may send a scan request to a *scannable* advertiser,
+  prompting it to transmit an extra scan-response packet. **Passive** never asks
+  for one.
+- For non-connectable beacons (they can't be scan-requested), and for devices the proxy
+  stays connected to — once connected, the connection dominates a device's power
+  use, not the scan mode. It mainly matters for advertisement-only sensors that
+  happen to be scannable.
+
+### Enabling passive scanning
+
+Passive scanning needs BlueZ's experimental features (and **BlueZ ≥ 5.56** with
+**Linux kernel ≥ 5.10**, which most current systems already have). Run
+`bluetoothd` with `--experimental`.
+
+Rather than editing the packaged unit, drop in an override so updates don't
+clobber it. Create `/etc/systemd/system/bluetooth.service.d/experimental.conf`:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/libexec/bluetooth/bluetoothd --experimental
+```
+
+The empty `ExecStart=` is required to clear the inherited command before
+setting the new one. Then reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart bluetooth
+```
+
+> Match the `bluetoothd` path to your system — some distros use
+> `/usr/lib/bluetooth/bluetoothd`. Check with `systemctl cat bluetooth | grep ExecStart`.
+
+Once enabled, the proxy logs `Starting BLE scanner (configured=passive,
+mode=passive)` and the active-fallback warning goes away.
+
 ## Reliability on Raspberry Pi
 
 Undervolting or brownout/undervoltage conditions on Pi's produce exactly the 
