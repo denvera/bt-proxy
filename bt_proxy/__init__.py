@@ -1,6 +1,6 @@
 """ESPHome Bluetooth Proxy implementation for Raspberry Pi."""
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # ESPHome firmware version reported to Home Assistant (in DeviceInfoResponse
 # and the mDNS TXT record). HA shows a repair/warning if a bluetooth proxy
