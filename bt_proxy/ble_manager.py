@@ -11,6 +11,15 @@ from bleak import BleakClient, BleakScanner
 from bleak.assigned_numbers import AdvertisementDataType
 from bleak.exc import BleakError
 from bleak.backends.bluezdbus.version import _get_bluetoothctl_version
+
+try:  # bleak >= 2.0: typed "Bluetooth not available" exception + reason enum
+    from bleak.exc import (
+        BleakBluetoothNotAvailableError,
+        BleakBluetoothNotAvailableReason,
+    )
+except ImportError:  # pragma: no cover - older bleak
+    BleakBluetoothNotAvailableError = None  # type: ignore[assignment,misc]
+    BleakBluetoothNotAvailableReason = None  # type: ignore[assignment,misc]
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
@@ -91,6 +100,20 @@ def _is_link_dead_error(error: Exception) -> bool:
     """
     err = str(error)
     return "Not connected" in err or "NoReply" in err
+
+
+def _adapter_powered_off_error(error: Exception) -> bool:
+    """Whether a scanner-start error means the adapter is powered off.
+
+    Most likely case is that the adapter is rfkill-(soft)blocked, or just
+    powered down.
+
+    """
+    return (
+        BleakBluetoothNotAvailableError is not None
+        and isinstance(error, BleakBluetoothNotAvailableError)
+        and error.reason == BleakBluetoothNotAvailableReason.POWERED_OFF
+    )
 
 
 def _is_daemon_wedge_error(error: Exception | None) -> bool:
@@ -497,15 +520,30 @@ class BLEManager:
             # in a tight loop. Report FAILED and re-arm slowly in the background
             # so we self-heal from a transient fault (or a manual reset).
             adapter = self._adapter or "hci0"
-            logger.error(
-                f"Could not start BLE scanner after {SCAN_START_MAX_RETRIES} "
-                f"attempts: {e}. The Bluetooth controller may be wedged at the "
-                f"HCI level (look for 'hci0: Opcode 0x200c failed' in dmesg); "
-                f"if so only an adapter reset clears it, e.g. 'sudo hciconfig "
-                f"{adapter} reset' (or 'sudo hciconfig {adapter} down && sudo "
-                f"hciconfig {adapter} up', or reboot) — restarting bluetoothd "
-                f"is not enough. Will re-try every {int(SCAN_REARM_INTERVAL)}s."
-            )
+            if _adapter_powered_off_error(e):
+                # The adapter isn't powered — most often soft-blocked by rfkill
+                # on a fresh install, not a controller wedge. Point at the real
+                # fix (a host action; even a privileged container can't power on
+                # an rfkill-blocked host adapter).
+                logger.error(
+                    f"Could not start BLE scanner: the Bluetooth adapter is "
+                    f"powered off or blocked ({e}). On a fresh install it's "
+                    f"usually soft-blocked by rfkill — on the host run "
+                    f"'sudo rfkill unblock bluetooth', then 'sudo hciconfig "
+                    f"{adapter} up' (or 'bluetoothctl power on') if it's still "
+                    f"down. Will re-try every {int(SCAN_REARM_INTERVAL)}s."
+                )
+            else:
+                logger.error(
+                    f"Could not start BLE scanner after {SCAN_START_MAX_RETRIES} "
+                    f"attempts: {e}. The Bluetooth controller may be wedged at "
+                    f"the HCI level (look for 'hci0: Opcode 0x200c failed' in "
+                    f"dmesg); if so only an adapter reset clears it, e.g. 'sudo "
+                    f"hciconfig {adapter} reset' (or 'sudo hciconfig {adapter} "
+                    f"down && sudo hciconfig {adapter} up', or reboot) — "
+                    f"restarting bluetoothd is not enough. Will re-try every "
+                    f"{int(SCAN_REARM_INTERVAL)}s."
+                )
             await self._teardown_scanner()
             self._scanning = False
             if self._scanner_state_callback:

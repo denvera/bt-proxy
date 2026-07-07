@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bt-proxy"
-version = "1.0.1"
+version = "1.0.2"
 description = "ESPHome-compatible Bluetooth Proxy for Raspberry Pi"
 readme = "README.md"
 requires-python = ">=3.9"

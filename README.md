@@ -175,6 +175,28 @@ The proxy also **backs off** instead of hammering the adapter when connections
 keep failing, which both protects a flaky controller and keeps the logs
 readable.
 
+### Adapter powered off / blocked by rfkill (common on a fresh install)
+
+If the proxy logs `the Bluetooth adapter is powered off or blocked` /
+`No powered Bluetooth adapters found ... POWERED_OFF`, the adapter simply isn't
+powered — it's **not** a wedged controller. On a fresh Raspberry Pi OS install
+the onboard Bluetooth is often **soft-blocked by rfkill**. Unblock it **on the
+host**:
+
+```bash
+sudo rfkill unblock bluetooth
+sudo hciconfig hci0 up          # only if it's still down afterwards
+```
+
+This is a host-level fix — even a `--privileged` container can't power on an
+rfkill-blocked host adapter. The proxy detects this case and keeps retrying
+(every 60s), so once you unblock it the scanner starts on its own without a
+restart.
+
+> `rfkill` may not be installed by default (`sudo apt install rfkill`). The
+> unblock is saved across reboots (via `systemd-rfkill`), so it's usually a
+> one-time fix.
+
 ### When bluetooth appears unresponsive
 
 Two distinct failures can occur on the onboard radio, with different fixes:
