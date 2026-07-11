@@ -143,17 +143,22 @@ async def test_plaintext_no_regression_hello_then_device_info():
 
 
 @pytest.mark.asyncio
-async def test_plaintext_refused_when_key_configured():
-    """0x00 with a key configured: connection closed, no HelloResponse."""
+async def test_plaintext_when_keyed_signals_encryption_required():
+    """0x00 with a key configured: the server replies with the 0x01 Noise
+    indicator (so a real client raises RequiresEncryptionAPIError and Home
+    Assistant prompts for the key) and then closes -- no HelloResponse."""
     ble = make_ble()
     server, port = await start_server(ble, encryption_key=PSK)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(proto.frame_message(proto.MSG_HELLO_REQUEST, b""))
         await writer.drain()
-        # No response should come; the server closes the socket -> EOF.
+        # The reply's indicator byte is 0x01 == "encryption required", never a
+        # 0x00 plaintext HelloResponse.
+        first = await asyncio.wait_for(reader.readexactly(1), 2.0)
+        assert first == b"\x01"
         with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError)):
-            await asyncio.wait_for(reader.readexactly(1), 2.0)
+            await asyncio.wait_for(reader.readexactly(4096), 2.0)
         writer.close()
     finally:
         await server.stop()

@@ -10,7 +10,12 @@ from typing import Any, Union
 
 from . import EMULATED_ESPHOME_VERSION, proto
 from .ble_manager import BLEManager
-from .noise import NoiseFrameHelper, NoiseHandshakeError
+from .noise import (
+    HANDSHAKE_FAILURE,
+    NoiseFrameHelper,
+    NoiseHandshakeError,
+    encode_frame,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +181,7 @@ class APIConnection:
 
         - ``0x01`` + key    -> Noise handshake; state becomes AUTHENTICATED.
         - ``0x01`` + no key  -> refuse (nothing to hand the client).
-        - ``0x00`` + key     -> refuse plaintext (encryption is required).
+        - ``0x00`` + key     -> signal encryption-required (0x01 frame), close.
         - ``0x00`` + no key  -> plaintext; deprecation warning; state CONNECTED.
         - anything else      -> refuse.
         """
@@ -208,11 +213,28 @@ class APIConnection:
 
         if first_byte == 0x00:
             if key is not None:
-                logger.warning(
-                    "Client %s attempted a plaintext connection (0x00) but "
-                    "encryption is required; refusing",
+                # Encryption is required, but the client probed with plaintext.
+                # Home Assistant always tries plaintext first and only prompts
+                # for the key once it learns the device is encrypted -- which it
+                # learns from a reply whose indicator byte is 0x01. So match
+                # ESPHome and send a 0x01-led frame: the client's plaintext
+                # helper reads that preamble and raises RequiresEncryptionAPIError
+                # (the signal HA needs), instead of the bare socket close it
+                # would otherwise surface as a generic connection error.
+                logger.info(
+                    "Client %s probed with plaintext but encryption is "
+                    "required; signaling encryption-required",
                     self._peer,
                 )
+                try:
+                    self.writer.write(
+                        encode_frame(
+                            bytes([HANDSHAKE_FAILURE]) + b"Encryption required"
+                        )
+                    )
+                    await self.writer.drain()
+                except (ConnectionResetError, OSError):
+                    pass
                 return False
             logger.warning(
                 "Client %s connected WITHOUT encryption (plaintext). "

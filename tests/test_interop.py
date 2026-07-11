@@ -17,8 +17,9 @@ transport and the state gate, not Bluetooth.
   2. Wrong key    -> explicit ``InvalidEncryptionKeyAPIError``, promptly (a hang
                      or bare TCP close is a FAILURE, asserted via a timeout that
                      is NOT caught by the narrowed ``pytest.raises``).
-  3. Plaintext refused when keyed -> raw ``0x00`` + HelloRequest gets no
-                     HelloResponse and the socket is closed.
+  3. Encryption required when keyed -> a real plaintext client is told
+                     encryption is required (RequiresEncryptionAPIError), so
+                     Home Assistant prompts for the key; wire reply starts 0x01.
   4. Backwards compat (no key)   -> the v1.0.2 plaintext flow still works end to
                      end over a raw socket, and the deprecation warning is
                      logged.
@@ -33,7 +34,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aioesphomeapi import APIClient
-from aioesphomeapi.core import InvalidEncryptionKeyAPIError
+from aioesphomeapi.core import (
+    InvalidEncryptionKeyAPIError,
+    RequiresEncryptionAPIError,
+)
 
 from bt_proxy import api_server, proto
 
@@ -168,18 +172,47 @@ async def test_wrong_key_is_rejected_explicitly_and_promptly():
 
 
 @pytest.mark.asyncio
-async def test_plaintext_refused_when_key_configured():
-    """0x00 + HelloRequest against a keyed server: no response, socket closed."""
+async def test_plaintext_client_gets_requires_encryption_when_keyed():
+    """A real plaintext client (no PSK) against a keyed server must be told that
+    encryption is required -- this is what makes Home Assistant prompt for the
+    key rather than showing a generic connection error.
+
+    Home Assistant always probes with plaintext first; the device signals its
+    encrypted-ness by replying with a 0x01-indicator frame, which aioesphomeapi
+    surfaces as RequiresEncryptionAPIError.
+    """
+    server, port = await start_server(encryption_key=PSK)
+    try:
+        client = APIClient(
+            address="127.0.0.1", port=port, password="", noise_psk=None
+        )
+        with pytest.raises(RequiresEncryptionAPIError):
+            await asyncio.wait_for(client.connect(login=True), timeout=TIMEOUT)
+        try:
+            await client.disconnect(force=True)
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+    finally:
+        await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_plaintext_probe_when_keyed_replies_with_encryption_indicator():
+    """Wire-level check: the encryption-required reply starts with the 0x01
+    Noise indicator byte (what the client reads as the requires-encryption
+    signal), and then the socket is closed."""
     server, port = await start_server(encryption_key=PSK)
     try:
         reader, writer = await asyncio.open_connection("127.0.0.1", port)
         writer.write(proto.frame_message(proto.MSG_HELLO_REQUEST, b""))
         await writer.drain()
-        # No HelloResponse must come; the server closes the socket -> EOF.
+        first = await asyncio.wait_for(reader.readexactly(1), timeout=TIMEOUT)
+        assert first == b"\x01"  # Noise indicator == "requires encryption"
+        # ...then the server closes the connection (no plaintext session).
         with pytest.raises(
             (asyncio.IncompleteReadError, ConnectionResetError)
         ):
-            await asyncio.wait_for(reader.readexactly(1), timeout=TIMEOUT)
+            await asyncio.wait_for(reader.readexactly(4096), timeout=TIMEOUT)
         writer.close()
     finally:
         await server.stop()
