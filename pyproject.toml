@@ -12,6 +12,14 @@ license = {text = "MIT"}
 dependencies = [
     "bleak>=0.21.0",
     "zeroconf>=0.80.0",
+    "noiseprotocol>=0.3.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "aioesphomeapi>=24.0",
 ]
 
 [project.scripts]
@@ -19,3 +27,7 @@ bt-proxy = "bt_proxy.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["bt_proxy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "strict"

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import logging
+import os
 import signal
 import socket
 import subprocess
@@ -15,8 +18,69 @@ from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 from . import EMULATED_ESPHOME_VERSION
 from .api_server import APIServer
 from .ble_manager import BLEManager
+from .noise import API_ENCRYPTION_NAME
 
 logger = logging.getLogger(__name__)
+
+#: Production-preferred way to supply the key: a CLI flag is visible in `ps`.
+ENCRYPTION_KEY_ENV_VAR = "BT_PROXY_ENCRYPTION_KEY"
+
+KEY_LENGTH = 32
+_HOWTO = "Generate one with: openssl rand -base64 32"
+
+UNENCRYPTED_WARNING = (
+    "Running WITHOUT encryption. Any device on this network can connect to "
+    "this proxy, control your Bluetooth adapter, read and write arbitrary "
+    "GATT characteristics on nearby devices, and receive a live feed of every "
+    "BLE advertisement in range. Set --encryption-key (or the "
+    f"{ENCRYPTION_KEY_ENV_VAR} environment variable) to enable Noise "
+    "encryption. Unauthenticated operation is DEPRECATED and will become "
+    "opt-in / be removed in 2.0."
+)
+
+
+def load_encryption_key(cli_value: str | None) -> bytes | None:
+    """Resolve and validate the Noise PSK.
+
+    Returns the 32 raw key bytes, or ``None`` when no key is configured (the
+    deprecated, backwards-compatible plaintext mode).
+
+    The CLI value takes precedence over the environment variable. A malformed
+    or wrong-length key raises :class:`SystemExit` -- it never degrades to
+    plaintext, because an operator who fat-fingered their key would otherwise
+    believe they were protected while exposing full Bluetooth control to the
+    network.
+
+    The key material is never included in any message raised or logged here.
+    """
+    raw_b64 = cli_value or os.environ.get(ENCRYPTION_KEY_ENV_VAR)
+    if not raw_b64:
+        return None
+
+    try:
+        key = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError) as err:
+        # Note: neither the key nor the underlying exception text (which can
+        # quote the input) is interpolated into the message.
+        raise SystemExit(
+            "Encryption key is not valid base64 "
+            f"(--encryption-key / {ENCRYPTION_KEY_ENV_VAR}). {_HOWTO}"
+        ) from err
+
+    if len(key) != KEY_LENGTH:
+        raise SystemExit(
+            "Encryption key must decode to exactly "
+            f"{KEY_LENGTH} bytes, got {len(key)} "
+            f"(--encryption-key / {ENCRYPTION_KEY_ENV_VAR}). {_HOWTO}"
+        )
+
+    return key
+
+
+def warn_if_unencrypted(key: bytes | None) -> None:
+    """Emit the startup deprecation warning when running in plaintext mode."""
+    if key is None:
+        logger.warning(UNENCRYPTED_WARNING)
 
 
 def get_local_ip() -> str:
@@ -58,9 +122,14 @@ def get_bt_mac(adapter: str | None = None) -> str:
 
 
 async def register_mdns(
-    name: str, port: int, mac: str
+    name: str, port: int, mac: str, encrypted: bool = False
 ) -> tuple[AsyncZeroconf, AsyncServiceInfo]:
-    """Register the service via mDNS so Home Assistant can discover it."""
+    """Register the service via mDNS so Home Assistant can discover it.
+
+    When ``encrypted`` is set, the ``api_encryption`` TXT property advertises
+    the Noise protocol name, which is how Home Assistant knows to ask for the
+    encryption key. With no key it keeps its historical empty value.
+    """
     local_ip = get_local_ip()
     logger.info("Advertising mDNS on %s:%d", local_ip, port)
 
@@ -75,7 +144,7 @@ async def register_mdns(
             "mac": mac.replace(":", "").lower(),
             "platform": "linux",
             "network": "wifi",
-            "api_encryption": "",
+            "api_encryption": API_ENCRYPTION_NAME if encrypted else "",
         },
         server=f"{name}.local.",
     )
@@ -85,7 +154,7 @@ async def register_mdns(
     return zc, info
 
 
-async def async_main(args: argparse.Namespace) -> None:
+async def async_main(args: argparse.Namespace, encryption_key: bytes | None) -> None:
     """Async main entry point."""
     bt_mac = get_bt_mac(args.adapter)
     logger.info("Bluetooth MAC: %s", bt_mac)
@@ -102,10 +171,13 @@ async def async_main(args: argparse.Namespace) -> None:
         mac_address=bt_mac,
         bt_mac_address=bt_mac,
         port=args.port,
+        encryption_key=encryption_key,
     )
 
     # Register mDNS
-    zc, service_info = await register_mdns(args.name, args.port, bt_mac)
+    zc, service_info = await register_mdns(
+        args.name, args.port, bt_mac, encrypted=encryption_key is not None
+    )
 
     # Start BLE scanning
     await ble_manager.start_scanning()
@@ -164,6 +236,18 @@ def main() -> None:
         help="Bluetooth adapter (e.g. hci0). Uses default if not specified.",
     )
     parser.add_argument(
+        "--encryption-key",
+        default=None,
+        help=(
+            "Base64-encoded 32-byte Noise pre-shared key, the same value used "
+            "in the Home Assistant integration. Generate one with "
+            "'openssl rand -base64 32'. Falls back to the "
+            f"{ENCRYPTION_KEY_ENV_VAR} environment variable, which is "
+            "preferred in production because a CLI flag is visible in 'ps' "
+            "output. If unset, the API is served unencrypted (DEPRECATED)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -177,7 +261,15 @@ def main() -> None:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
-    asyncio.run(async_main(args))
+    # Validate before anything binds a socket: a bad key is fatal, never a
+    # silent downgrade to plaintext.
+    encryption_key = load_encryption_key(args.encryption_key)
+    if encryption_key is not None:
+        logger.info("API encryption enabled (%s)", API_ENCRYPTION_NAME)
+    else:
+        warn_if_unencrypted(encryption_key)
+
+    asyncio.run(async_main(args, encryption_key))
 
 
 if __name__ == "__main__":
