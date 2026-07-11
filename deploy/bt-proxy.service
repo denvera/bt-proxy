@@ -1,0 +1,21 @@
+[Unit]
+Description=Bluetooth Proxy (ESPHome-compatible)
+# BlueZ must be up before we try to talk to the adapter over D-Bus.
+After=bluetooth.target network-online.target dbus.service
+Wants=bluetooth.target network-online.target
+Requires=dbus.service
+
+[Service]
+Type=simple
+# Optional runtime config: put BT_PROXY_ENCRYPTION_KEY=... and/or
+# BT_PROXY_ARGS=--name my-proxy in this file. The leading "-" means the
+# unit still starts if the file is absent (unauthenticated, backwards-compatible).
+EnvironmentFile=-/etc/bt-proxy/bt-proxy.env
+# Uses the venv built by deploy/install.sh. No uv (uv has no ARMv6 build).
+ExecStart=/opt/bt-proxy/.venv/bin/python -m bt_proxy --log-level INFO $BT_PROXY_ARGS
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

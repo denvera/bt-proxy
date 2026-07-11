@@ -1,0 +1,64 @@
+# Deploy to a Raspberry Pi Zero W
+
+A direct guide to run bt-proxy on a Raspberry Pi Zero W (or Zero 2 W) and have it
+auto-discovered by Home Assistant. No Docker.
+
+**Needs:** a Pi Zero **W** (onboard Bluetooth + Wi-Fi — a non-W Zero has neither),
+an SD card, and Home Assistant on the same LAN.
+
+> This code must be on GitHub first. Push your branch / merge to `main` before
+> starting — the Pi clones it.
+
+## 1. Flash the card
+
+Use [Raspberry Pi Imager](https://www.raspberrypi.com/software/):
+
+- **OS:** Raspberry Pi OS Lite (32-bit).
+- Click the gear / **Edit Settings** (Ctrl+Shift+X) before writing:
+  - **Hostname:** `bt-proxy`
+  - **Enable SSH** → *Allow public-key authentication*, paste your public key.
+  - **Wi-Fi:** SSID, password, and your **Wi-Fi country** (required, or the radio stays off).
+  - **Locale/timezone.**
+- Write the card, put it in the Pi, power on. Give it ~1 minute to join Wi-Fi.
+
+## 2. SSH in and install
+
+```bash
+ssh <you>@bt-proxy.local
+
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/denvera/bt-proxy.git /opt/bt-proxy
+sudo /opt/bt-proxy/deploy/install.sh
+```
+
+The installer sets up a Python venv (piwheels supplies prebuilt ARM wheels — nothing
+compiles), installs the `bt-proxy` systemd service, and starts it.
+
+## 3. (Recommended) Turn on encryption
+
+Generate a key and reinstall with it — or add it later by editing
+`/etc/bt-proxy/bt-proxy.env` and running `sudo systemctl restart bt-proxy`:
+
+```bash
+openssl rand -base64 32          # copy this
+sudo BT_PROXY_ENCRYPTION_KEY="<that key>" /opt/bt-proxy/deploy/install.sh
+```
+
+Use the **same** key in Home Assistant when you adopt the device. Without a key the
+proxy still works but runs unauthenticated (deprecated).
+
+## 4. Adopt in Home Assistant
+
+Within a minute or two it appears under **Settings → Devices & Services** as a
+discovered **ESPHome** device (it advertises itself over mDNS). Click **Add**; enter
+the encryption key if you set one.
+
+## Check / troubleshoot
+
+```bash
+systemctl status bt-proxy          # is it running?
+journalctl -u bt-proxy -f          # live logs
+bluetoothctl show                  # is the BT adapter up?
+```
+
+To update later: `cd /opt/bt-proxy && sudo git pull && sudo ./deploy/install.sh`.
