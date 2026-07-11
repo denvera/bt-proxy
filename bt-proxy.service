@@ -6,6 +6,13 @@ Wants=bluetooth.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/bt-proxy
+# Recommended: supply the Noise encryption key via the environment (NOT on the
+# ExecStart line, where it would be visible in `ps`). Generate a key with
+# `openssl rand -base64 32` and set the SAME key in Home Assistant.
+# Uncomment ONE of the following:
+#Environment=BT_PROXY_ENCRYPTION_KEY=<base64 key>
+#EnvironmentFile=/etc/bt-proxy.env    # a file containing: BT_PROXY_ENCRYPTION_KEY=<base64 key>
+# Without a key the proxy still starts, but runs UNENCRYPTED (deprecated).
 ExecStart=uv run python -m bt_proxy --log-level INFO
 Restart=on-failure
 RestartSec=10
