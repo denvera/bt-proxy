@@ -148,6 +148,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now bt-proxy
 ```
 
+> This unit runs the app via `uv`. On a **Raspberry Pi Zero (ARMv6)** `uv` has no
+> build — use [`deploy/install.sh`](deploy/README.md) instead, which sets up a
+> plain venv and its own unit. Both read config from `/etc/bt-proxy/bt-proxy.env`
+> (`BT_PROXY_ENCRYPTION_KEY`, `BT_PROXY_NAME`, `BT_PROXY_FRIENDLY_NAME`).
+
 Check status / logs:
 
 ```bash

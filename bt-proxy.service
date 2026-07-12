@@ -6,13 +6,20 @@ Wants=bluetooth.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/bt-proxy
-# Recommended: supply the Noise encryption key via the environment (NOT on the
-# ExecStart line, where it would be visible in `ps`). Generate a key with
-# `openssl rand -base64 32` and set the SAME key in Home Assistant.
-# Uncomment ONE of the following:
-#Environment=BT_PROXY_ENCRYPTION_KEY=<base64 key>
-#EnvironmentFile=/etc/bt-proxy.env    # a file containing: BT_PROXY_ENCRYPTION_KEY=<base64 key>
+# Optional runtime config in /etc/bt-proxy/bt-proxy.env (the same path the
+# deploy/install.sh installer uses). The leading "-" means the unit still starts
+# if the file is absent, so unencrypted/backwards-compatible operation keeps
+# working. Put in that file:
+#   BT_PROXY_ENCRYPTION_KEY=<base64 key>       # openssl rand -base64 32; use the
+#                                              # SAME key in Home Assistant
+#   BT_PROXY_NAME=living-room-proxy
+#   BT_PROXY_FRIENDLY_NAME=Living Room Proxy    # may contain spaces
+# Set name/friendly-name via these variables, NOT as command-line args: systemd
+# word-splits an expanded arg string on whitespace, breaking a multi-word name.
 # Without a key the proxy still starts, but runs UNENCRYPTED (deprecated).
+EnvironmentFile=-/etc/bt-proxy/bt-proxy.env
+# This unit runs the app via `uv`. On a Raspberry Pi Zero (ARMv6) uv has no
+# build -- use deploy/install.sh + deploy/bt-proxy.service (a plain venv) there.
 ExecStart=uv run python -m bt_proxy --log-level INFO
 Restart=on-failure
 RestartSec=10
