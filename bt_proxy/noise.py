@@ -284,10 +284,21 @@ class NoiseFrameHelper:
     # -- transport ----------------------------------------------------------
 
     async def read_message(self) -> tuple[int, bytes]:
-        """Read, decrypt and parse one transport message."""
+        """Read, decrypt and parse one transport message.
+
+        A zero-length transport frame carries no ciphertext -- a real Noise
+        message always includes at least the 16-byte AEAD tag -- so it is never
+        valid post-handshake. Skip such frames rather than handing an empty
+        buffer to decrypt(), which would raise InvalidTag and needlessly drop an
+        otherwise healthy authenticated session over one spurious 3-byte frame.
+        A genuinely corrupt (non-empty) frame still fails to decrypt and closes
+        the connection, as before.
+        """
         if not self._handshake_complete or self._proto is None:
             raise NoiseError("read_message() before the handshake completed")
         frame = await self._read_frame()
+        while not frame:
+            frame = await self._read_frame()
         try:
             plaintext = self._proto.decrypt(frame)
         except InvalidTag as err:

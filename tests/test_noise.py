@@ -276,3 +276,48 @@ async def test_psk_is_never_logged(caplog):
     assert repr(PSK) not in text
     for record in caplog.records:
         assert PSK not in str(record.args).encode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------------------
+# A zero-length transport frame must be skipped, not fatal.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedReader:
+    """A StreamReader stand-in that returns pre-scripted chunks in order."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    async def readexactly(self, n):
+        chunk = self._chunks.pop(0)
+        assert len(chunk) == n, (len(chunk), n)
+        return chunk
+
+
+@pytest.mark.asyncio
+async def test_read_message_skips_zero_length_frame():
+    """A spurious 0x01 0x00 0x00 (empty) frame is skipped; the next real frame
+    is decrypted normally -- the session is not dropped."""
+    from unittest.mock import MagicMock
+
+    from bt_proxy import noise
+
+    helper = noise.NoiseFrameHelper(
+        MagicMock(), MagicMock(), bytes(range(32)), "n", "AA:BB:CC:DD:EE:FF"
+    )
+    helper._handshake_complete = True
+    inner = noise.encode_inner(7, b"hello")  # msg type 7, payload "hello"
+    proto_mock = MagicMock()
+    proto_mock.decrypt = MagicMock(return_value=inner)
+    helper._proto = proto_mock
+
+    # empty frame (01 00 00), then a real 5-byte frame (01 00 05 + ciphertext).
+    helper._reader = _ScriptedReader(
+        [b"\x01\x00\x00", b"\x01\x00\x05", b"ABCDE"]
+    )
+
+    msg_type, data = await helper.read_message()
+    assert (msg_type, data) == (7, b"hello")
+    # decrypt was only ever called on the real ciphertext, never on b"".
+    proto_mock.decrypt.assert_called_once_with(b"ABCDE")
