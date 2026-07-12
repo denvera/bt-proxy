@@ -37,6 +37,27 @@ apt-get install -y --no-install-recommends bluez python3-venv python3-pip
 echo "==> Ensuring the Bluetooth stack is enabled"
 systemctl enable --now bluetooth
 
+# Passive BLE scanning needs bluetoothd started with --experimental (BlueZ
+# AdvertisementMonitor). Without it, a proxy asked for passive scanning by Home
+# Assistant silently falls back to ACTIVE scanning, which on a Pi Zero W means
+# ~5x the advertisements and ~2x the CPU (the shared WiFi/BT antenna also makes
+# active scanning peg NetworkManager). This one flag is the single biggest CPU
+# win on constrained hardware.
+echo "==> Enabling BlueZ --experimental (required for passive scanning)"
+BLUETOOTHD=$(systemctl show bluetooth -p ExecStart --value | grep -oE '/[^ ]*bluetoothd' | head -1)
+if [ -n "$BLUETOOTHD" ]; then
+    mkdir -p /etc/systemd/system/bluetooth.service.d
+    printf '[Service]\nExecStart=\nExecStart=%s --experimental\n' "$BLUETOOTHD" \
+        > /etc/systemd/system/bluetooth.service.d/experimental.conf
+    systemctl daemon-reload
+    systemctl restart bluetooth
+fi
+
+# mpris-proxy bridges Bluetooth media (AVRCP/MPRIS) to D-Bus. It is useless on a
+# headless BLE proxy and gets woken by every advertisement, wasting CPU. Disable
+# it globally so it does not start for any session.
+systemctl --global disable mpris-proxy.service 2>/dev/null || true
+
 # Place the code at a stable path so the unit file's paths are predictable.
 if [ "$REPO_DIR" != "$TARGET" ]; then
     echo "==> Copying $REPO_DIR -> $TARGET"

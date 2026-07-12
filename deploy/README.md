@@ -62,3 +62,23 @@ bluetoothctl show                  # is the BT adapter up?
 ```
 
 To update later: `cd /opt/bt-proxy && sudo git pull && sudo ./deploy/install.sh`.
+
+## Performance on a Pi Zero W
+
+A Pi Zero W (single ARMv6 core, shared WiFi/BT antenna) is marginal for BLE
+proxying. The single most important thing is **passive scanning**, which the
+installer enables by putting `bluetoothd` into `--experimental` mode. Without
+it, when Home Assistant requests passive scanning the proxy silently falls back
+to **active** scanning — roughly 5x the advertisements and 2x the CPU, and the
+extra radio activity pegs NetworkManager via antenna coexistence. Confirm the
+proxy is passive:
+
+```bash
+journalctl -u bt-proxy | grep "Starting BLE scanner" | tail -1
+# want: configured=passive, mode=passive   (not "falling back to active")
+```
+
+The installer also disables `mpris-proxy` (a Bluetooth media bridge that wastes
+CPU on a headless proxy). Even so, a busy RF environment can still load the core
+heavily — if it stays pegged, the realistic fix is a Pi Zero 2 W / Pi 3+ or a
+dedicated ESP32 running ESPHome, not more tuning.
