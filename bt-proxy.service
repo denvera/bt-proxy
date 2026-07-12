@@ -1,7 +1,10 @@
 [Unit]
 Description=Bluetooth Proxy (ESPHome-compatible)
-After=bluetooth.target dbus.service
-Wants=bluetooth.target
+# BlueZ must be up before we talk to the adapter over D-Bus; the network must be
+# up for mDNS discovery. (Kept in sync with deploy/bt-proxy.service.)
+After=bluetooth.target network-online.target dbus.service
+Wants=bluetooth.target network-online.target
+Requires=dbus.service
 
 [Service]
 Type=simple

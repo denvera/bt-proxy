@@ -9,75 +9,14 @@ its very first message.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
+from conftest import PSK, make_ble, read_one_plaintext, start_server
+
 from bt_proxy import api_server, proto
-from bt_proxy.noise import NoiseFrameHelper
-
-PSK = bytes(range(32))
-
-
-# ---------------------------------------------------------------------------
-# Test doubles / helpers
-# ---------------------------------------------------------------------------
-
-
-def make_ble() -> MagicMock:
-    """A BLEManager stand-in with spies on the radio-driving methods."""
-    ble = MagicMock()
-    ble.set_callbacks = MagicMock()
-    ble.connect_device = AsyncMock(return_value=(False, 0, 0))
-    ble.disconnect_device = AsyncMock()
-    ble.set_scan_mode = AsyncMock()
-    ble.get_connection = MagicMock(return_value=None)
-    ble.free_connections = 3
-    ble.max_connections = 3
-    ble.allocated_addresses = []
-    ble._scanning = True
-    ble._effective_scan_active = True
-    ble._scan_active = True
-    return ble
-
-
-async def start_server(ble, encryption_key=None):
-    """Start an APIServer on an ephemeral port; return (server, port)."""
-    kwargs = {}
-    if encryption_key is not None:
-        kwargs["encryption_key"] = encryption_key
-    server = api_server.APIServer(
-        ble,
-        name="bt-proxy",
-        mac_address="AA:BB:CC:DD:EE:FF",
-        bt_mac_address="AA:BB:CC:DD:EE:FF",
-        port=0,
-        **kwargs,
-    )
-    await server.start()
-    port = server._server.sockets[0].getsockname()[1]
-    return server, port
-
-
-async def read_one_plaintext(reader) -> tuple[int, bytes]:
-    """Read a single 0x00-framed message from a raw socket."""
-    preamble = await reader.readexactly(1)
-    assert preamble == b"\x00"
-    data_length = await _read_varint(reader)
-    msg_type = await _read_varint(reader)
-    data = await reader.readexactly(data_length) if data_length else b""
-    return msg_type, data
-
-
-async def _read_varint(reader) -> int:
-    result = 0
-    shift = 0
-    while True:
-        b = (await reader.readexactly(1))[0]
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return result
-        shift += 7
+from bt_proxy.noise import FrameTooLargeError, NoiseFrameHelper
 
 
 def ble_connect_request(address: int = 0x112233445566) -> bytes:
@@ -221,20 +160,13 @@ async def test_deprecation_warning_logged_per_connection(caplog):
 # ---------------------------------------------------------------------------
 
 
-def test_handler_table_default_is_gated():
-    """A handler entry given as a bare callable defaults to AUTHENTICATED."""
+def test_every_handler_declares_its_gate():
+    """Every dispatch-table entry is an explicit (handler, State) tuple, so no
+    handler can be added without declaring the state it is gated behind."""
     for msg_type, entry in api_server._MESSAGE_HANDLERS.items():
         assert isinstance(entry, tuple) and len(entry) == 2, (msg_type, entry)
         _handler, required = entry
         assert isinstance(required, api_server.State)
-
-    # Bare callables normalize to the safe (authenticated) default.
-    def _fake(self, data):
-        return None
-
-    handler, required = api_server._normalize_handler(_fake)
-    assert handler is _fake
-    assert required is api_server.State.AUTHENTICATED
 
 
 def test_ble_gatt_handlers_require_authentication():
@@ -361,7 +293,7 @@ class _CappedTransport:
 
     def write_message(self, msg_type: int, data: bytes) -> None:
         if len(data) > self.cap:
-            raise ValueError(f"frame too big: {len(data)} > {self.cap}")
+            raise FrameTooLargeError(f"frame too big: {len(data)} > {self.cap}")
         self.frames.append((msg_type, data))
 
 

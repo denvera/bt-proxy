@@ -6,12 +6,13 @@ import asyncio
 import enum
 import logging
 import time
-from typing import Any, Union
+from typing import Any
 
 from . import EMULATED_ESPHOME_VERSION, proto
 from .ble_manager import BLEManager
 from .noise import (
     HANDSHAKE_FAILURE,
+    FrameTooLargeError,
     NoiseFrameHelper,
     NoiseHandshakeError,
     encode_frame,
@@ -23,11 +24,10 @@ logger = logging.getLogger(__name__)
 ADV_BATCH_INTERVAL = 0.1
 
 
-class State(enum.Enum):
+class State(enum.IntEnum):
     """Connection lifecycle state; drives the dispatch gate.
 
-    States are ordered so that a handler's minimum requirement can be checked
-    with a simple ``>=`` on ``.value``.
+    An IntEnum so a handler's minimum requirement is a plain ``>=`` comparison.
     """
 
     HANDSHAKE = 0  # transport not yet selected
@@ -268,7 +268,7 @@ class APIConnection:
             logger.debug("Unhandled message type %d", msg_type)
             return
         handler, required = entry
-        if self._state.value < required.value:
+        if self._state < required:
             # A message arrived before the connection is authenticated. Close
             # rather than silently ignore it: a client waiting for a reply would
             # otherwise hang until its own timeout ("the proxy appears dead"),
@@ -670,7 +670,7 @@ class APIConnection:
                     self._adv_batch = []
                     self._flush_advertisements(batch)
                     try:
-                        await self.writer.drain()
+                        await self._transport.drain()
                     except (ConnectionResetError, OSError):
                         break
         except asyncio.CancelledError:
@@ -683,7 +683,7 @@ class APIConnection:
         transport's frame-size limit.
 
         The Noise transport caps a single frame at 65535 bytes, so a dense batch
-        can exceed it and ``write_message`` raises ``ValueError``. Left
+        can exceed it and ``write_message`` raises ``FrameTooLargeError``. Left
         unhandled that kills the flush task and the client silently stops
         receiving *all* advertisements until it reconnects. Splitting keeps the
         task alive and drops no advertisements. Plaintext has no cap, so the
@@ -694,7 +694,7 @@ class APIConnection:
         resp = proto.encode_ble_raw_advertisements_response(batch)
         try:
             self._send_message(proto.MSG_BLE_RAW_ADVERTISEMENTS_RESPONSE, resp)
-        except ValueError:
+        except FrameTooLargeError:
             if len(batch) == 1:
                 # A single BLE advertisement is tens of bytes and cannot exceed
                 # the frame limit; if one somehow does, drop it rather than
@@ -715,7 +715,14 @@ class APIConnection:
             self._adv_flush_task.cancel()
             self._adv_flush_task = None
         try:
-            self.writer.close()
+            # Close through the transport when one was selected, so its own
+            # _closed guard is set; fall back to the raw writer otherwise (the
+            # connection dropped before transport selection). Both wrap the same
+            # underlying writer, so wait_closed() applies either way.
+            if self._transport is not None:
+                self._transport.close()
+            else:
+                self.writer.close()
             await self.writer.wait_closed()
         except Exception:
             pass
@@ -723,66 +730,36 @@ class APIConnection:
         self.server.remove_connection(self)
 
 
-# Handler dispatch table.
+# Gated dispatch table: ``msg_type -> (handler, minimum_state)``.
 #
-# Each entry is either ``(handler, minimum_state)`` or a bare ``handler``. A
-# bare handler is normalized to require ``State.AUTHENTICATED`` -- i.e. the
-# SAFE case is the default, so a handler added without an explicit state is
-# gated, never accidentally exposed pre-authentication.
-#
-# Only the pre-authentication handshake messages (Hello, Connect, DeviceInfo,
-# Ping, Disconnect) are marked ``State.CONNECTED``. Every BLE/GATT handler
-# relies on the authenticated default.
-_HandlerEntry = Union[Any, tuple[Any, "State"]]
-
-
-def _normalize_handler(entry: _HandlerEntry) -> tuple[Any, State]:
-    """Normalize a table entry to ``(handler, required_state)``.
-
-    Bare handlers default to ``State.AUTHENTICATED`` so the safe case wins.
-    """
-    if isinstance(entry, tuple):
-        return entry
-    return (entry, State.AUTHENTICATED)
-
-
-_RAW_MESSAGE_HANDLERS: dict[int, _HandlerEntry] = {
-    # Pre-authentication handshake messages.
+# Every entry states its required state explicitly, so a handler cannot be added
+# without declaring its gate (a bare entry fails loudly at unpack rather than
+# being silently exposed). Only the handshake messages (Hello, Connect,
+# DeviceInfo, Ping, Disconnect) are reachable at ``State.CONNECTED``; every
+# BLE/GATT handler requires ``State.AUTHENTICATED``.
+_MESSAGE_HANDLERS: dict[int, tuple[Any, State]] = {
     proto.MSG_HELLO_REQUEST: (APIConnection._handle_hello, State.CONNECTED),
     proto.MSG_CONNECT_REQUEST: (APIConnection._handle_connect, State.CONNECTED),
-    proto.MSG_DEVICE_INFO_REQUEST: (
-        APIConnection._handle_device_info,
-        State.CONNECTED,
-    ),
+    proto.MSG_DEVICE_INFO_REQUEST: (APIConnection._handle_device_info, State.CONNECTED),
     proto.MSG_PING_REQUEST: (APIConnection._handle_ping, State.CONNECTED),
-    proto.MSG_DISCONNECT_REQUEST: (
-        APIConnection._handle_disconnect,
-        State.CONNECTED,
-    ),
-    # Everything below relies on the authenticated-by-default normalization.
-    proto.MSG_LIST_ENTITIES_REQUEST: APIConnection._handle_list_entities,
-    proto.MSG_SUBSCRIBE_STATES_REQUEST: APIConnection._handle_subscribe_states,
-    proto.MSG_SUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: APIConnection._handle_subscribe_ble_advertisements,
-    proto.MSG_UNSUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: APIConnection._handle_unsubscribe_ble_advertisements,
-    proto.MSG_SUBSCRIBE_BLE_CONNECTIONS_FREE_REQUEST: APIConnection._handle_subscribe_connections_free,
-    proto.MSG_BLE_DEVICE_REQUEST: APIConnection._handle_ble_device_request,
-    proto.MSG_BLE_GATT_GET_SERVICES_REQUEST: APIConnection._handle_gatt_get_services,
-    proto.MSG_BLE_GATT_READ_REQUEST: APIConnection._handle_gatt_read,
-    proto.MSG_BLE_GATT_WRITE_REQUEST: APIConnection._handle_gatt_write,
-    proto.MSG_BLE_GATT_READ_DESCRIPTOR_REQUEST: APIConnection._handle_gatt_read_descriptor,
-    proto.MSG_BLE_GATT_WRITE_DESCRIPTOR_REQUEST: APIConnection._handle_gatt_write_descriptor,
-    proto.MSG_BLE_GATT_NOTIFY_REQUEST: APIConnection._handle_gatt_notify,
-    proto.MSG_BLE_SCANNER_SET_MODE_REQUEST: APIConnection._handle_scanner_set_mode,
-    proto.MSG_SUBSCRIBE_LOGS_REQUEST: APIConnection._handle_subscribe_logs,
-    proto.MSG_GET_TIME_REQUEST: APIConnection._handle_get_time,
-    proto.MSG_SUBSCRIBE_HOMEASSISTANT_SERVICES_REQUEST: APIConnection._handle_noop,
-    proto.MSG_SUBSCRIBE_HOMEASSISTANT_STATES_REQUEST: APIConnection._handle_noop,
-}
-
-#: The gated dispatch table: ``msg_type -> (handler, minimum_state)``.
-_MESSAGE_HANDLERS: dict[int, tuple[Any, State]] = {
-    msg_type: _normalize_handler(entry)
-    for msg_type, entry in _RAW_MESSAGE_HANDLERS.items()
+    proto.MSG_DISCONNECT_REQUEST: (APIConnection._handle_disconnect, State.CONNECTED),
+    proto.MSG_LIST_ENTITIES_REQUEST: (APIConnection._handle_list_entities, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_STATES_REQUEST: (APIConnection._handle_subscribe_states, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: (APIConnection._handle_subscribe_ble_advertisements, State.AUTHENTICATED),
+    proto.MSG_UNSUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: (APIConnection._handle_unsubscribe_ble_advertisements, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_BLE_CONNECTIONS_FREE_REQUEST: (APIConnection._handle_subscribe_connections_free, State.AUTHENTICATED),
+    proto.MSG_BLE_DEVICE_REQUEST: (APIConnection._handle_ble_device_request, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_GET_SERVICES_REQUEST: (APIConnection._handle_gatt_get_services, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_READ_REQUEST: (APIConnection._handle_gatt_read, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_WRITE_REQUEST: (APIConnection._handle_gatt_write, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_READ_DESCRIPTOR_REQUEST: (APIConnection._handle_gatt_read_descriptor, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_WRITE_DESCRIPTOR_REQUEST: (APIConnection._handle_gatt_write_descriptor, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_NOTIFY_REQUEST: (APIConnection._handle_gatt_notify, State.AUTHENTICATED),
+    proto.MSG_BLE_SCANNER_SET_MODE_REQUEST: (APIConnection._handle_scanner_set_mode, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_LOGS_REQUEST: (APIConnection._handle_subscribe_logs, State.AUTHENTICATED),
+    proto.MSG_GET_TIME_REQUEST: (APIConnection._handle_get_time, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_HOMEASSISTANT_SERVICES_REQUEST: (APIConnection._handle_noop, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_HOMEASSISTANT_STATES_REQUEST: (APIConnection._handle_noop, State.AUTHENTICATED),
 }
 
 

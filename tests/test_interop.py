@@ -30,7 +30,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aioesphomeapi import APIClient
@@ -39,11 +38,12 @@ from aioesphomeapi.core import (
     RequiresEncryptionAPIError,
 )
 
-from bt_proxy import api_server, proto
+from conftest import PSK, read_one_plaintext, start_server
 
-# Two distinct, valid-format 32-byte PSKs. WRONG_PSK is a real key the server
-# was NOT configured with -- the handshake MAC must fail against it.
-PSK = bytes(range(32))
+from bt_proxy import proto
+
+# PSK is imported from conftest. WRONG_PSK is a distinct valid-format key the
+# server was NOT configured with -- the handshake MAC must fail against it.
 WRONG_PSK = bytes((b + 7) & 0xFF for b in range(32))
 PSK_B64 = base64.b64encode(PSK).decode()
 WRONG_B64 = base64.b64encode(WRONG_PSK).decode()
@@ -54,64 +54,6 @@ MAC = "AA:BB:CC:DD:EE:FF"
 # A handshake/connect that hangs is the failure this suite exists to catch, so
 # every wait is bounded well below any plausible real completion time.
 TIMEOUT = 10.0
-
-
-# ---------------------------------------------------------------------------
-# Fixtures / helpers
-# ---------------------------------------------------------------------------
-
-
-def make_ble() -> MagicMock:
-    """A BLEManager stand-in -- this suite tests the transport, not Bluetooth."""
-    ble = MagicMock()
-    ble.set_callbacks = MagicMock()
-    ble.connect_device = AsyncMock(return_value=(False, 0, 0))
-    ble.disconnect_device = AsyncMock()
-    ble.set_scan_mode = AsyncMock()
-    ble.get_connection = MagicMock(return_value=None)
-    ble.free_connections = 3
-    ble.max_connections = 3
-    ble.allocated_addresses = []
-    ble._scanning = True
-    ble._effective_scan_active = True
-    ble._scan_active = True
-    return ble
-
-
-async def start_server(encryption_key=None):
-    """Start a real APIServer on an ephemeral port. Returns (server, port)."""
-    server = api_server.APIServer(
-        make_ble(),
-        name=NAME,
-        mac_address=MAC,
-        bt_mac_address=MAC,
-        port=0,
-        encryption_key=encryption_key,
-    )
-    await server.start()
-    port = server._server.sockets[0].getsockname()[1]
-    return server, port
-
-
-async def _read_varint(reader) -> int:
-    result = 0
-    shift = 0
-    while True:
-        b = (await reader.readexactly(1))[0]
-        result |= (b & 0x7F) << shift
-        if not (b & 0x80):
-            return result
-        shift += 7
-
-
-async def read_one_plaintext(reader) -> tuple[int, bytes]:
-    """Read a single 0x00-framed plaintext message from a raw socket."""
-    preamble = await reader.readexactly(1)
-    assert preamble == b"\x00", preamble
-    data_length = await _read_varint(reader)
-    msg_type = await _read_varint(reader)
-    data = await reader.readexactly(data_length) if data_length else b""
-    return msg_type, data
 
 
 # ---------------------------------------------------------------------------

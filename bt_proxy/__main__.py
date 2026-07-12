@@ -295,8 +295,7 @@ def main() -> None:
     encryption_key = load_encryption_key(args.encryption_key)
     if encryption_key is not None:
         logger.info("API encryption enabled (%s)", API_ENCRYPTION_NAME)
-    else:
-        warn_if_unencrypted(encryption_key)
+    warn_if_unencrypted(encryption_key)  # self-guards; a no-op when a key is set
 
     asyncio.run(async_main(args, encryption_key))
 

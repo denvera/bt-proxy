@@ -44,8 +44,9 @@ logger = logging.getLogger(__name__)
 
 NOISE_PROTOCOL_NAME = b"Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 
-#: Value advertised in the mDNS ``api_encryption`` TXT record.
-API_ENCRYPTION_NAME = "Noise_NNpsk0_25519_ChaChaPoly_SHA256"
+#: Value advertised in the mDNS ``api_encryption`` TXT record (one source of
+#: truth with the bytes form above).
+API_ENCRYPTION_NAME = NOISE_PROTOCOL_NAME.decode()
 
 INDICATOR = 0x01
 PROLOGUE_INIT = b"NoiseAPIInit"
@@ -77,6 +78,15 @@ class NoiseHandshakeError(NoiseError):
     """The Noise handshake could not be completed (e.g. a wrong PSK)."""
 
 
+class FrameTooLargeError(ValueError):
+    """A message/frame exceeds the Noise transport size limit.
+
+    A subclass of ValueError so existing callers keep working, but named so the
+    dispatch layer can catch *this* specifically (and split a batch) rather than
+    swallowing every ValueError.
+    """
+
+
 # --- Pure framing helpers (unit-testable without any I/O) -------------------
 
 
@@ -84,11 +94,11 @@ def encode_frame(payload: bytes) -> bytes:
     """Frame a payload: ``0x01`` + uint16be(len) + payload."""
     length = len(payload)
     if length > MAX_FRAME_LEN:
-        raise ValueError(
+        raise FrameTooLargeError(
             f"Noise frame payload of {length} bytes exceeds the "
             f"{MAX_FRAME_LEN}-byte transport limit"
         )
-    return bytes((INDICATOR, (length >> 8) & 0xFF, length & 0xFF)) + payload
+    return bytes((INDICATOR,)) + length.to_bytes(2, "big") + payload
 
 
 def build_prologue(hello_body: bytes) -> bytes:
@@ -97,10 +107,7 @@ def build_prologue(hello_body: bytes) -> bytes:
     ``b"NoiseAPIInit"`` + uint16be(len(body)) + body. The client hello body is
     empty in practice, so this is normally ``b"NoiseAPIInit\\x00\\x00"``.
     """
-    length = len(hello_body)
-    return (
-        PROLOGUE_INIT + bytes(((length >> 8) & 0xFF, length & 0xFF)) + hello_body
-    )
+    return PROLOGUE_INIT + len(hello_body).to_bytes(2, "big") + hello_body
 
 
 def build_server_hello(name: str, mac: str) -> bytes:
@@ -121,23 +128,13 @@ def encode_inner(msg_type: int, data: bytes) -> bytes:
     """
     length = len(data)
     if length > MAX_MESSAGE_LEN:
-        raise ValueError(
+        raise FrameTooLargeError(
             f"Message of {length} bytes exceeds the maximum encryptable payload "
             f"of {MAX_MESSAGE_LEN} bytes (Noise 65535-byte transport limit, "
             f"less the {AEAD_TAG_LEN}-byte AEAD tag and the "
             f"{INNER_HEADER_LEN}-byte header)"
         )
-    return (
-        bytes(
-            (
-                (msg_type >> 8) & 0xFF,
-                msg_type & 0xFF,
-                (length >> 8) & 0xFF,
-                length & 0xFF,
-            )
-        )
-        + data
-    )
+    return msg_type.to_bytes(2, "big") + length.to_bytes(2, "big") + data
 
 
 def decode_inner(plaintext: bytes) -> tuple[int, bytes]:
@@ -151,7 +148,7 @@ def decode_inner(plaintext: bytes) -> tuple[int, bytes]:
         raise ValueError(
             f"Decrypted message too short: {len(plaintext)} bytes"
         )
-    msg_type = (plaintext[0] << 8) | plaintext[1]
+    msg_type = int.from_bytes(plaintext[:2], "big")
     return msg_type, plaintext[INNER_HEADER_LEN:]
 
 
@@ -201,7 +198,7 @@ class NoiseFrameHelper:
         header = await self._reader.readexactly(3)
         if header[0] != INDICATOR:
             raise NoiseError(f"Invalid frame indicator byte: 0x{header[0]:02x}")
-        length = (header[1] << 8) | header[2]
+        length = int.from_bytes(header[1:3], "big")
         if length == 0:
             return b""
         return await self._reader.readexactly(length)
