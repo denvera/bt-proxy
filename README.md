@@ -42,6 +42,7 @@ uv run python -m bt_proxy
 | `--port` | `6053` | API server TCP port |
 | `--max-connections` | `3` | Max concurrent BLE GATT connections |
 | `--adapter` | system default | Bluetooth adapter (e.g. `hci0`) |
+| `--encryption-key` | none | Base64 Noise PSK; also `BT_PROXY_ENCRYPTION_KEY` env var (see [Encryption](#encryption)) |
 | `--log-level` | `INFO` | Logging verbosity |
 
 ### Example
@@ -57,7 +58,56 @@ uv run python -m bt_proxy --name living-room-proxy --friendly-name "Living Room 
 3. Listens on TCP port 6053 for ESPHome Native API connections
 4. When Home Assistant connects, it forwards BLE advertisements and handles GATT operations
 
-> **Note:** This uses the ESPHome Native API **plaintext** variant (no encryption). The Noise-encrypted protocol is currently not supported.
+> **Note:** By default this uses the ESPHome Native API **plaintext** variant
+> (no encryption). It also supports the Noise-encrypted protocol — see
+> [Encryption](#encryption) below, which is the recommended way to run it.
+
+## Encryption
+
+The API supports ESPHome's **Noise** encryption. When a key is set, connections
+are encrypted and authenticated, and plaintext connections are refused. When no
+key is set, the API is served in plaintext (see the deprecation notice below).
+
+> **Deprecation notice:** Running **without** an encryption key is **deprecated**.
+> An unauthenticated proxy lets any device on your network connect, take full
+> control of your Bluetooth adapter (read/write arbitrary GATT characteristics on
+> nearby devices), and receive a live feed of every BLE advertisement in range.
+> Unauthenticated operation becomes **opt-in in 2.0**. This is **opt-in**:
+> upgrading alone changes nothing — if you upgrade and set no key you remain
+> exposed. **Set a key.**
+
+Generate a key:
+
+```bash
+openssl rand -base64 32
+```
+
+Supply it to the proxy either via the `--encryption-key` flag or the
+`BT_PROXY_ENCRYPTION_KEY` environment variable:
+
+```bash
+# Preferred in production: the env var keeps the key out of `ps` output
+export BT_PROXY_ENCRYPTION_KEY="<base64 key>"
+uv run python -m bt_proxy
+
+# Or via the flag (visible in `ps`, so avoid this on shared/production hosts)
+uv run python -m bt_proxy --encryption-key "<base64 key>"
+```
+
+> **Prefer the environment variable in production.** A key passed as a CLI flag
+> is visible to any local user in `ps` output; an environment variable is not.
+
+Then configure the **same** key in Home Assistant's ESPHome device (or in its
+YAML):
+
+```yaml
+api:
+  encryption:
+    key: "<same base64 key>"
+```
+
+An invalid or wrong-length key is a fatal error — the proxy will not silently
+fall back to plaintext.
 
 ## Running with Docker
 
@@ -97,6 +147,11 @@ sudo cp bt-proxy.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now bt-proxy
 ```
+
+> This unit runs the app via `uv`. On a **Raspberry Pi Zero (ARMv6)** `uv` has no
+> build — use [`deploy/install.sh`](deploy/README.md) instead, which sets up a
+> plain venv and its own unit. Both read config from `/etc/bt-proxy/bt-proxy.env`
+> (`BT_PROXY_ENCRYPTION_KEY`, `BT_PROXY_NAME`, `BT_PROXY_FRIENDLY_NAME`).
 
 Check status / logs:
 

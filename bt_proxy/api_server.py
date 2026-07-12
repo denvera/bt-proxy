@@ -3,17 +3,130 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
 import time
 from typing import Any
 
 from . import EMULATED_ESPHOME_VERSION, proto
 from .ble_manager import BLEManager
+from .noise import (
+    HANDSHAKE_FAILURE,
+    FrameTooLargeError,
+    NoiseFrameHelper,
+    NoiseHandshakeError,
+    encode_frame,
+)
 
 logger = logging.getLogger(__name__)
 
 # How often to flush batched advertisements (seconds)
 ADV_BATCH_INTERVAL = 0.1
+
+
+class State(enum.IntEnum):
+    """Connection lifecycle state; drives the dispatch gate.
+
+    An IntEnum so a handler's minimum requirement is a plain ``>=`` comparison.
+    """
+
+    HANDSHAKE = 0  # transport not yet selected
+    CONNECTED = 1  # transport up, pre-authentication (plaintext mode)
+    AUTHENTICATED = 2  # Noise handshake done, or plaintext Connect completed
+
+
+class _PrefixReader:
+    """Wraps a stream reader, yielding a small already-consumed prefix first.
+
+    Transport selection peeks the first byte off the socket; this replays it so
+    the chosen frame helper sees a pristine stream and needs no special-casing
+    of the first message.
+    """
+
+    def __init__(self, reader: asyncio.StreamReader, prefix: bytes) -> None:
+        self._reader = reader
+        self._prefix = prefix
+
+    async def readexactly(self, n: int) -> bytes:
+        if not self._prefix:
+            return await self._reader.readexactly(n)
+        if n <= len(self._prefix):
+            chunk, self._prefix = self._prefix[:n], self._prefix[n:]
+            return chunk
+        chunk, self._prefix = self._prefix, b""
+        return chunk + await self._reader.readexactly(n - len(chunk))
+
+
+class PlaintextFrameHelper:
+    """Plaintext ESPHome framing over an asyncio stream pair.
+
+    A faithful extraction of the original ``_read_message`` / ``_read_varint``
+    logic, exposing the same interface as
+    :class:`~bt_proxy.noise.NoiseFrameHelper` so that :class:`APIConnection`
+    has a single dispatch loop for both transports.
+
+    Wire format: ``0x00`` + varint(data_length) + varint(msg_type) + data.
+    """
+
+    def __init__(
+        self,
+        reader: _PrefixReader | asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._closed = False
+
+    async def read_message(self) -> tuple[int, bytes]:
+        """Read one framed message from the wire."""
+        preamble = await self._reader.readexactly(1)
+        if preamble[0] != 0x00:
+            raise ValueError(f"Invalid preamble: 0x{preamble[0]:02x}")
+
+        data_length = await self._read_varint()
+        msg_type = await self._read_varint()
+
+        if data_length > 0:
+            data = await self._reader.readexactly(data_length)
+        else:
+            data = b""
+
+        return msg_type, data
+
+    async def _read_varint(self) -> int:
+        """Read a varint from the stream."""
+        result = 0
+        shift = 0
+        while True:
+            byte_data = await self._reader.readexactly(1)
+            byte = byte_data[0]
+            result |= (byte & 0x7F) << shift
+            if (byte & 0x80) == 0:
+                return result
+            shift += 7
+            if shift >= 64:
+                raise ValueError("Varint too long")
+
+    def write_message(self, msg_type: int, data: bytes) -> None:
+        """Send a framed message to the client."""
+        if self._closed:
+            return
+        self._writer.write(proto.frame_message(msg_type, data))
+
+    async def drain(self) -> None:
+        """Flush the write buffer."""
+        if self._closed:
+            return
+        await self._writer.drain()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._writer.close()
+        except Exception:  # noqa: BLE001 - already going away
+            pass
 
 
 class APIConnection:
@@ -34,46 +147,28 @@ class APIConnection:
         self._adv_flush_task: asyncio.Task[None] | None = None
         self._closed = False
         self._peer = writer.get_extra_info("peername", ("unknown", 0))
+        # Transport (plaintext or Noise) and connection state are established
+        # by _select_transport() before the dispatch loop runs.
+        self._transport: PlaintextFrameHelper | NoiseFrameHelper | None = None
+        self._state = State.HANDSHAKE
 
     async def run(self) -> None:
-        """Main loop: read and dispatch messages from the client."""
+        """Main loop: select transport, then read and dispatch messages."""
         logger.info("Client connected from %s", self._peer)
         try:
-            # Peek at first byte to detect Noise vs plaintext
+            # Peek at the first byte to select the transport.
             first = await self.reader.readexactly(1)
-            if first[0] == 0x01:
-                # Noise protocol - client expects encryption
-                # Read the rest of the Noise hello to log it, then reject
-                logger.warning(
-                    "Client %s sent Noise protocol (0x01), not plaintext",
-                    self._peer,
-                )
+            if not await self._select_transport(first[0]):
                 return
-            elif first[0] != 0x00:
-                logger.warning(
-                    "Client %s sent unknown preamble 0x%02x",
-                    self._peer,
-                    first[0],
-                )
-                return
-            # Put the preamble byte back by handling the first message inline
-            data_length = await self._read_varint()
-            msg_type = await self._read_varint()
-            if data_length > 0:
-                data = await self.reader.readexactly(data_length)
-            else:
-                data = b""
-            logger.debug(
-                "First message: type=%d len=%d data=%s",
-                msg_type,
-                data_length,
-                data.hex() if data else "(empty)",
-            )
-            await self._handle_message(msg_type, data)
 
             while not self._closed:
-                msg_type, data = await self._read_message()
+                msg_type, data = await self._transport.read_message()
                 await self._handle_message(msg_type, data)
+                await self._transport.drain()
+        except NoiseHandshakeError as err:
+            logger.warning(
+                "Noise handshake with %s failed: %s", self._peer, err
+            )
         except (asyncio.IncompleteReadError, ConnectionResetError, OSError):
             logger.info("Client %s disconnected", self._peer)
         except Exception:
@@ -81,53 +176,116 @@ class APIConnection:
         finally:
             await self._cleanup()
 
-    async def _read_message(self) -> tuple[int, bytes]:
-        """Read one framed message from the wire.
+    async def _select_transport(self, first_byte: int) -> bool:
+        """Choose the transport from the first byte. Returns False to close.
 
-        Wire format: 0x00 + varint(data_length) + varint(msg_type) + data
+        - ``0x01`` + key    -> Noise handshake; state becomes AUTHENTICATED.
+        - ``0x01`` + no key  -> refuse (nothing to hand the client).
+        - ``0x00`` + key     -> signal encryption-required (0x01 frame), close.
+        - ``0x00`` + no key  -> plaintext; deprecation warning; state CONNECTED.
+        - anything else      -> refuse.
         """
-        preamble = await self.reader.readexactly(1)
-        if preamble[0] != 0x00:
-            raise ValueError(f"Invalid preamble: 0x{preamble[0]:02x}")
+        key = self.server.encryption_key
+        # Replay the peeked byte so the frame helper sees a pristine stream.
+        reader = _PrefixReader(self.reader, bytes((first_byte,)))
 
-        data_length = await self._read_varint()
-        msg_type = await self._read_varint()
+        if first_byte == 0x01:
+            if key is None:
+                logger.warning(
+                    "Client %s requested Noise encryption (0x01) but no "
+                    "encryption key is configured; refusing",
+                    self._peer,
+                )
+                return False
+            helper = NoiseFrameHelper(
+                reader,
+                self.writer,
+                key,
+                self.server.name,
+                self.server.mac_address,
+            )
+            # A PSK mismatch raises NoiseHandshakeError, handled by run().
+            await helper.perform_handshake()
+            self._transport = helper
+            # The handshake IS the authentication.
+            self._state = State.AUTHENTICATED
+            return True
 
-        if data_length > 0:
-            data = await self.reader.readexactly(data_length)
-        else:
-            data = b""
+        if first_byte == 0x00:
+            if key is not None:
+                # Encryption is required, but the client probed with plaintext.
+                # Home Assistant always tries plaintext first and only prompts
+                # for the key once it learns the device is encrypted -- which it
+                # learns from a reply whose indicator byte is 0x01. So match
+                # ESPHome and send a 0x01-led frame: the client's plaintext
+                # helper reads that preamble and raises RequiresEncryptionAPIError
+                # (the signal HA needs), instead of the bare socket close it
+                # would otherwise surface as a generic connection error.
+                logger.info(
+                    "Client %s probed with plaintext but encryption is "
+                    "required; signaling encryption-required",
+                    self._peer,
+                )
+                try:
+                    self.writer.write(
+                        encode_frame(
+                            bytes([HANDSHAKE_FAILURE]) + b"Encryption required"
+                        )
+                    )
+                    await self.writer.drain()
+                except (ConnectionResetError, OSError):
+                    pass
+                return False
+            logger.warning(
+                "Client %s connected WITHOUT encryption (plaintext). "
+                "Unauthenticated plaintext operation is DEPRECATED; configure "
+                "an encryption key to require Noise.",
+                self._peer,
+            )
+            self._transport = PlaintextFrameHelper(reader, self.writer)
+            self._state = State.CONNECTED
+            return True
 
-        return msg_type, data
-
-    async def _read_varint(self) -> int:
-        """Read a varint from the stream."""
-        result = 0
-        shift = 0
-        while True:
-            byte_data = await self.reader.readexactly(1)
-            byte = byte_data[0]
-            result |= (byte & 0x7F) << shift
-            if (byte & 0x80) == 0:
-                return result
-            shift += 7
-            if shift >= 64:
-                raise ValueError("Varint too long")
+        logger.warning(
+            "Client %s sent unknown preamble 0x%02x", self._peer, first_byte
+        )
+        return False
 
     def _send_message(self, msg_type: int, data: bytes) -> None:
-        """Send a framed message to the client."""
-        if self._closed:
+        """Send a framed message to the client over the active transport."""
+        if self._closed or self._transport is None:
             return
-        frame = proto.frame_message(msg_type, data)
-        self.writer.write(frame)
+        self._transport.write_message(msg_type, data)
 
     async def _handle_message(self, msg_type: int, data: bytes) -> None:
-        """Dispatch a received message to the appropriate handler."""
-        handler = _MESSAGE_HANDLERS.get(msg_type)
-        if handler:
-            await handler(self, data)
-        else:
+        """Dispatch a received message, gated by the connection state.
+
+        This is the single place dispatch is gated. Each handler carries a
+        minimum required state in the table; anything below it is refused.
+        """
+        entry = _MESSAGE_HANDLERS.get(msg_type)
+        if entry is None:
             logger.debug("Unhandled message type %d", msg_type)
+            return
+        handler, required = entry
+        if self._state < required:
+            # A message arrived before the connection is authenticated. Close
+            # rather than silently ignore it: a client waiting for a reply would
+            # otherwise hang until its own timeout ("the proxy appears dead"),
+            # and silently dropping each message lets a peer flood the log with
+            # no bound. Closing gives a definitive EOF and caps this to one line
+            # per connection. (The standard Home Assistant flow sends
+            # ConnectRequest first and never trips this.)
+            logger.warning(
+                "Client %s sent message type %d before authentication "
+                "(state=%s); closing the connection",
+                self._peer,
+                msg_type,
+                self._state.name,
+            )
+            self._closed = True
+            return
+        await handler(self, data)
 
     # ------------------------------------------------------------------
     # Protocol handlers
@@ -180,6 +338,10 @@ class APIConnection:
         # No password required, so invalid_password = false
         resp = proto.encode_field_bool(1, False)
         self._send_message(proto.MSG_CONNECT_RESPONSE, resp)
+        # In plaintext mode, ConnectRequest completes authentication and opens
+        # the BLE/GATT handlers. In Noise mode the connection is already
+        # AUTHENTICATED; this transition is monotonic and harmless there.
+        self._state = State.AUTHENTICATED
 
     async def _handle_ping(self, _data: bytes) -> None:
         self._send_message(proto.MSG_PING_RESPONSE, b"")
@@ -506,16 +668,46 @@ class APIConnection:
                 if self._adv_batch:
                     batch = self._adv_batch
                     self._adv_batch = []
-                    resp = proto.encode_ble_raw_advertisements_response(batch)
-                    self._send_message(
-                        proto.MSG_BLE_RAW_ADVERTISEMENTS_RESPONSE, resp
-                    )
+                    self._flush_advertisements(batch)
                     try:
-                        await self.writer.drain()
+                        await self._transport.drain()
                     except (ConnectionResetError, OSError):
                         break
         except asyncio.CancelledError:
             pass
+
+    def _flush_advertisements(
+        self, batch: list[tuple[int, int, int, bytes]]
+    ) -> None:
+        """Encode and send an advertisement batch, splitting it to fit the
+        transport's frame-size limit.
+
+        The Noise transport caps a single frame at 65535 bytes, so a dense batch
+        can exceed it and ``write_message`` raises ``FrameTooLargeError``. Left
+        unhandled that kills the flush task and the client silently stops
+        receiving *all* advertisements until it reconnects. Splitting keeps the
+        task alive and drops no advertisements. Plaintext has no cap, so the
+        common case sends exactly one frame.
+        """
+        if not batch:
+            return
+        resp = proto.encode_ble_raw_advertisements_response(batch)
+        try:
+            self._send_message(proto.MSG_BLE_RAW_ADVERTISEMENTS_RESPONSE, resp)
+        except FrameTooLargeError:
+            if len(batch) == 1:
+                # A single BLE advertisement is tens of bytes and cannot exceed
+                # the frame limit; if one somehow does, drop it rather than
+                # recurse forever.
+                logger.warning(
+                    "Dropping an advertisement that exceeds the frame size "
+                    "limit (%d bytes)",
+                    len(resp),
+                )
+                return
+            mid = len(batch) // 2
+            self._flush_advertisements(batch[:mid])
+            self._flush_advertisements(batch[mid:])
 
     async def _cleanup(self) -> None:
         self._closed = True
@@ -523,7 +715,14 @@ class APIConnection:
             self._adv_flush_task.cancel()
             self._adv_flush_task = None
         try:
-            self.writer.close()
+            # Close through the transport when one was selected, so its own
+            # _closed guard is set; fall back to the raw writer otherwise (the
+            # connection dropped before transport selection). Both wrap the same
+            # underlying writer, so wait_closed() applies either way.
+            if self._transport is not None:
+                self._transport.close()
+            else:
+                self.writer.close()
             await self.writer.wait_closed()
         except Exception:
             pass
@@ -531,30 +730,36 @@ class APIConnection:
         self.server.remove_connection(self)
 
 
-# Handler dispatch table
-_MESSAGE_HANDLERS: dict[int, Any] = {
-    proto.MSG_HELLO_REQUEST: APIConnection._handle_hello,
-    proto.MSG_CONNECT_REQUEST: APIConnection._handle_connect,
-    proto.MSG_DEVICE_INFO_REQUEST: APIConnection._handle_device_info,
-    proto.MSG_LIST_ENTITIES_REQUEST: APIConnection._handle_list_entities,
-    proto.MSG_SUBSCRIBE_STATES_REQUEST: APIConnection._handle_subscribe_states,
-    proto.MSG_PING_REQUEST: APIConnection._handle_ping,
-    proto.MSG_DISCONNECT_REQUEST: APIConnection._handle_disconnect,
-    proto.MSG_SUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: APIConnection._handle_subscribe_ble_advertisements,
-    proto.MSG_UNSUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: APIConnection._handle_unsubscribe_ble_advertisements,
-    proto.MSG_SUBSCRIBE_BLE_CONNECTIONS_FREE_REQUEST: APIConnection._handle_subscribe_connections_free,
-    proto.MSG_BLE_DEVICE_REQUEST: APIConnection._handle_ble_device_request,
-    proto.MSG_BLE_GATT_GET_SERVICES_REQUEST: APIConnection._handle_gatt_get_services,
-    proto.MSG_BLE_GATT_READ_REQUEST: APIConnection._handle_gatt_read,
-    proto.MSG_BLE_GATT_WRITE_REQUEST: APIConnection._handle_gatt_write,
-    proto.MSG_BLE_GATT_READ_DESCRIPTOR_REQUEST: APIConnection._handle_gatt_read_descriptor,
-    proto.MSG_BLE_GATT_WRITE_DESCRIPTOR_REQUEST: APIConnection._handle_gatt_write_descriptor,
-    proto.MSG_BLE_GATT_NOTIFY_REQUEST: APIConnection._handle_gatt_notify,
-    proto.MSG_BLE_SCANNER_SET_MODE_REQUEST: APIConnection._handle_scanner_set_mode,
-    proto.MSG_SUBSCRIBE_LOGS_REQUEST: APIConnection._handle_subscribe_logs,
-    proto.MSG_GET_TIME_REQUEST: APIConnection._handle_get_time,
-    proto.MSG_SUBSCRIBE_HOMEASSISTANT_SERVICES_REQUEST: APIConnection._handle_noop,
-    proto.MSG_SUBSCRIBE_HOMEASSISTANT_STATES_REQUEST: APIConnection._handle_noop,
+# Gated dispatch table: ``msg_type -> (handler, minimum_state)``.
+#
+# Every entry states its required state explicitly, so a handler cannot be added
+# without declaring its gate (a bare entry fails loudly at unpack rather than
+# being silently exposed). Only the handshake messages (Hello, Connect,
+# DeviceInfo, Ping, Disconnect) are reachable at ``State.CONNECTED``; every
+# BLE/GATT handler requires ``State.AUTHENTICATED``.
+_MESSAGE_HANDLERS: dict[int, tuple[Any, State]] = {
+    proto.MSG_HELLO_REQUEST: (APIConnection._handle_hello, State.CONNECTED),
+    proto.MSG_CONNECT_REQUEST: (APIConnection._handle_connect, State.CONNECTED),
+    proto.MSG_DEVICE_INFO_REQUEST: (APIConnection._handle_device_info, State.CONNECTED),
+    proto.MSG_PING_REQUEST: (APIConnection._handle_ping, State.CONNECTED),
+    proto.MSG_DISCONNECT_REQUEST: (APIConnection._handle_disconnect, State.CONNECTED),
+    proto.MSG_LIST_ENTITIES_REQUEST: (APIConnection._handle_list_entities, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_STATES_REQUEST: (APIConnection._handle_subscribe_states, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: (APIConnection._handle_subscribe_ble_advertisements, State.AUTHENTICATED),
+    proto.MSG_UNSUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST: (APIConnection._handle_unsubscribe_ble_advertisements, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_BLE_CONNECTIONS_FREE_REQUEST: (APIConnection._handle_subscribe_connections_free, State.AUTHENTICATED),
+    proto.MSG_BLE_DEVICE_REQUEST: (APIConnection._handle_ble_device_request, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_GET_SERVICES_REQUEST: (APIConnection._handle_gatt_get_services, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_READ_REQUEST: (APIConnection._handle_gatt_read, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_WRITE_REQUEST: (APIConnection._handle_gatt_write, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_READ_DESCRIPTOR_REQUEST: (APIConnection._handle_gatt_read_descriptor, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_WRITE_DESCRIPTOR_REQUEST: (APIConnection._handle_gatt_write_descriptor, State.AUTHENTICATED),
+    proto.MSG_BLE_GATT_NOTIFY_REQUEST: (APIConnection._handle_gatt_notify, State.AUTHENTICATED),
+    proto.MSG_BLE_SCANNER_SET_MODE_REQUEST: (APIConnection._handle_scanner_set_mode, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_LOGS_REQUEST: (APIConnection._handle_subscribe_logs, State.AUTHENTICATED),
+    proto.MSG_GET_TIME_REQUEST: (APIConnection._handle_get_time, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_HOMEASSISTANT_SERVICES_REQUEST: (APIConnection._handle_noop, State.AUTHENTICATED),
+    proto.MSG_SUBSCRIBE_HOMEASSISTANT_STATES_REQUEST: (APIConnection._handle_noop, State.AUTHENTICATED),
 }
 
 
@@ -569,6 +774,7 @@ class APIServer:
         mac_address: str = "",
         bt_mac_address: str = "",
         port: int = 6053,
+        encryption_key: bytes | None = None,
     ):
         self.ble_manager = ble_manager
         self.name = name
@@ -576,6 +782,8 @@ class APIServer:
         self.mac_address = mac_address
         self.bt_mac_address = bt_mac_address
         self.port = port
+        #: The 32-byte Noise PSK, or None for deprecated plaintext mode.
+        self.encryption_key = encryption_key
         self._connections: list[APIConnection] = []
         self._server: asyncio.Server | None = None
 

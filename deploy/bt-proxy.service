@@ -1,0 +1,26 @@
+[Unit]
+Description=Bluetooth Proxy (ESPHome-compatible)
+# BlueZ must be up before we try to talk to the adapter over D-Bus.
+After=bluetooth.target network-online.target dbus.service
+Wants=bluetooth.target network-online.target
+Requires=dbus.service
+
+[Service]
+Type=simple
+# Optional runtime config in this file (leading "-" => the unit still starts if
+# it is absent, so plaintext/backwards-compatible operation keeps working):
+#   BT_PROXY_ENCRYPTION_KEY=<base64 key>
+#   BT_PROXY_NAME=living-room-proxy
+#   BT_PROXY_FRIENDLY_NAME=Living Room Proxy      # may contain spaces
+# Set name/friendly-name via these variables, NOT via a single arg string:
+# systemd word-splits an expanded variable on whitespace regardless of quotes,
+# which would break a multi-word friendly name.
+EnvironmentFile=-/etc/bt-proxy/bt-proxy.env
+# Uses the venv built by deploy/install.sh. No uv (uv has no ARMv6 build).
+ExecStart=/opt/bt-proxy/.venv/bin/python -m bt_proxy --log-level INFO
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
