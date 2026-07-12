@@ -68,9 +68,11 @@ if [ ! -f "$ENV_FILE" ]; then
 # Leaving this unset keeps the proxy unauthenticated (deprecated).
 ${BT_PROXY_ENCRYPTION_KEY:+BT_PROXY_ENCRYPTION_KEY=${BT_PROXY_ENCRYPTION_KEY}}
 
-# Extra CLI args, e.g. a friendly name shown in Home Assistant:
-# BT_PROXY_ARGS=--name living-room-proxy --friendly-name "Living Room Proxy"
-BT_PROXY_ARGS=
+# Device name and friendly name shown in Home Assistant. Set them here (each as
+# its own variable) rather than as command-line args -- a friendly name with
+# spaces cannot survive systemd's word-splitting of an argument string.
+# BT_PROXY_NAME=living-room-proxy
+# BT_PROXY_FRIENDLY_NAME=Living Room Proxy
 EOF
     chmod 600 "$ENV_FILE"
 elif [ -n "${BT_PROXY_ENCRYPTION_KEY:-}" ]; then

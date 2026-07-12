@@ -12,7 +12,12 @@ import logging
 
 import pytest
 
-from bt_proxy.__main__ import load_encryption_key, register_mdns, warn_if_unencrypted
+from bt_proxy.__main__ import (
+    build_parser,
+    load_encryption_key,
+    register_mdns,
+    warn_if_unencrypted,
+)
 from bt_proxy.noise import API_ENCRYPTION_NAME
 
 VALID_RAW = bytes(range(32))
@@ -156,3 +161,33 @@ def test_key_material_never_logged(caplog):
     text = caplog.text
     assert VALID_B64 not in text
     assert VALID_RAW.hex() not in text
+
+
+# ---------------------------------------------------------------------------
+# Name / friendly-name come from env vars (spaces-safe), CLI wins over env.
+# ---------------------------------------------------------------------------
+
+
+def test_env_vars_set_name_and_friendly_name(monkeypatch):
+    """A friendly name with spaces set via BT_PROXY_FRIENDLY_NAME survives
+    intact -- this is what the systemd unit relies on instead of a word-split
+    argument string."""
+    monkeypatch.setenv("BT_PROXY_NAME", "living-room-proxy")
+    monkeypatch.setenv("BT_PROXY_FRIENDLY_NAME", "Living Room Proxy")
+    args = build_parser().parse_args([])
+    assert args.name == "living-room-proxy"
+    assert args.friendly_name == "Living Room Proxy"
+
+
+def test_cli_flag_overrides_env(monkeypatch):
+    monkeypatch.setenv("BT_PROXY_FRIENDLY_NAME", "From Env")
+    args = build_parser().parse_args(["--friendly-name", "From CLI"])
+    assert args.friendly_name == "From CLI"
+
+
+def test_defaults_when_env_unset(monkeypatch):
+    monkeypatch.delenv("BT_PROXY_NAME", raising=False)
+    monkeypatch.delenv("BT_PROXY_FRIENDLY_NAME", raising=False)
+    args = build_parser().parse_args([])
+    assert args.name == "bt-proxy"
+    assert args.friendly_name == "Bluetooth Proxy"

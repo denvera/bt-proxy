@@ -204,25 +204,48 @@ async def async_main(args: argparse.Namespace, encryption_key: bytes | None) -> 
     logger.info("Shutdown complete")
 
 
-def main() -> None:
+def _env_default(env_var: str, fallback: str | None) -> str | None:
+    """Return the environment value for ``env_var`` if set and non-empty.
+
+    Used for options that may legitimately contain spaces (the device name and
+    friendly name): a value set via the service's EnvironmentFile reaches us as
+    a single environment variable, so it is immune to the shell/systemd
+    word-splitting that mangles a multi-word value passed through a single
+    argument string like ``$BT_PROXY_ARGS``.
+    """
+    value = os.environ.get(env_var)
+    return value if value else fallback
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser.
+
+    String options that may contain spaces fall back to environment variables
+    (name -> BT_PROXY_NAME, friendly name -> BT_PROXY_FRIENDLY_NAME) so a
+    deployment can set them without fighting word-splitting. Explicit CLI flags
+    still win over the environment.
+    """
     parser = argparse.ArgumentParser(
         description="ESPHome-compatible Bluetooth Proxy for Raspberry Pi"
     )
     parser.add_argument(
         "--name",
-        default="bt-proxy",
-        help="Device name (default: bt-proxy)",
+        default=_env_default("BT_PROXY_NAME", "bt-proxy"),
+        help="Device name (env: BT_PROXY_NAME; default: bt-proxy)",
     )
     parser.add_argument(
         "--friendly-name",
-        default="Bluetooth Proxy",
-        help="Friendly name (default: Bluetooth Proxy)",
+        default=_env_default("BT_PROXY_FRIENDLY_NAME", "Bluetooth Proxy"),
+        help=(
+            "Friendly name; may contain spaces (env: BT_PROXY_FRIENDLY_NAME; "
+            "default: Bluetooth Proxy)"
+        ),
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=6053,
-        help="API server port (default: 6053)",
+        default=int(_env_default("BT_PROXY_PORT", "6053")),
+        help="API server port (env: BT_PROXY_PORT; default: 6053)",
     )
     parser.add_argument(
         "--max-connections",
@@ -232,8 +255,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--adapter",
-        default=None,
-        help="Bluetooth adapter (e.g. hci0). Uses default if not specified.",
+        default=_env_default("BT_PROXY_ADAPTER", None),
+        help=(
+            "Bluetooth adapter (e.g. hci0; env: BT_PROXY_ADAPTER). "
+            "Uses default if not specified."
+        ),
     )
     parser.add_argument(
         "--encryption-key",
@@ -253,8 +279,11 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Log level (default: INFO)",
     )
+    return parser
 
-    args = parser.parse_args()
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
