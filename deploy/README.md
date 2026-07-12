@@ -6,9 +6,6 @@ auto-discovered by Home Assistant. No Docker.
 **Needs:** a Pi Zero **W** (onboard Bluetooth + Wi-Fi — a non-W Zero has neither),
 an SD card, and Home Assistant on the same LAN.
 
-> This code must be on GitHub first. Push your branch / merge to `main` before
-> starting — the Pi clones it.
-
 ## 1. Flash the card
 
 Use [Raspberry Pi Imager](https://www.raspberrypi.com/software/):
@@ -31,8 +28,9 @@ git clone https://github.com/denvera/bt-proxy.git /opt/bt-proxy
 sudo /opt/bt-proxy/deploy/install.sh
 ```
 
-The installer sets up a Python venv (piwheels supplies prebuilt ARM wheels — nothing
-compiles), installs the `bt-proxy` systemd service, and starts it.
+The installer sets up a Python venv, installs the `bt-proxy` systemd service, and
+starts it. On a Pi Zero this can take tens of minutes (some dependencies compile
+from source).
 
 ## 3. (Recommended) Turn on encryption
 

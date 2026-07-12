@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# Install bt-proxy as a systemd service on Raspberry Pi OS (Bookworm).
+# Install bt-proxy as a systemd service on Raspberry Pi OS (Bookworm or Trixie).
 #
 # Designed for a headless Raspberry Pi Zero / Zero W (ARMv6): it uses a plain
-# Python venv and relies on piwheels (the default index on Raspberry Pi OS) for
-# prebuilt ARM wheels, so nothing is compiled from source. No Docker, no uv.
+# Python venv and prefers piwheels (the default index on Raspberry Pi OS) for
+# prebuilt ARM wheels. Packages without a matching wheel (e.g. zeroconf on a
+# newer Python) still compile from source, which on a Pi Zero can take tens of
+# minutes. No Docker, no uv.
 #
 # Usage (on the Pi, after SSHing in):
-#   git clone https://github.com/<you>/bt-proxy /opt/bt-proxy
+#   git clone https://github.com/denvera/bt-proxy /opt/bt-proxy
 #   sudo /opt/bt-proxy/deploy/install.sh
 #
 # Optional Noise encryption: pass a base64 32-byte key and it is written to
@@ -36,6 +38,9 @@ apt-get install -y --no-install-recommends bluez python3-venv python3-pip
 
 echo "==> Ensuring the Bluetooth stack is enabled"
 systemctl enable --now bluetooth
+# A fresh install often has the adapter soft-blocked (rfkill) or powered down.
+rfkill unblock bluetooth 2>/dev/null || true
+bluetoothctl power on 2>/dev/null || true
 
 # Passive BLE scanning needs bluetoothd started with --experimental (BlueZ
 # AdvertisementMonitor). Without it, a proxy asked for passive scanning by Home
@@ -67,7 +72,9 @@ if [ "$REPO_DIR" != "$TARGET" ]; then
         --exclude='.pytest_cache' -cf - . | tar -C "$TARGET" -xf -
 fi
 
-echo "==> Building venv and installing bt-proxy (piwheels provides ARM wheels)"
+echo "==> Building venv and installing bt-proxy"
+echo "    Any package without a prebuilt wheel compiles from source -- on a Pi"
+echo "    Zero this can take tens of minutes (zeroconf especially). Grab a coffee."
 python3 -m venv "$TARGET/.venv"
 "$TARGET/.venv/bin/pip" install --upgrade pip
 # On Raspberry Pi OS /etc/pip.conf already points at piwheels; add it explicitly
