@@ -660,16 +660,46 @@ class APIConnection:
                 if self._adv_batch:
                     batch = self._adv_batch
                     self._adv_batch = []
-                    resp = proto.encode_ble_raw_advertisements_response(batch)
-                    self._send_message(
-                        proto.MSG_BLE_RAW_ADVERTISEMENTS_RESPONSE, resp
-                    )
+                    self._flush_advertisements(batch)
                     try:
                         await self.writer.drain()
                     except (ConnectionResetError, OSError):
                         break
         except asyncio.CancelledError:
             pass
+
+    def _flush_advertisements(
+        self, batch: list[tuple[int, int, int, bytes]]
+    ) -> None:
+        """Encode and send an advertisement batch, splitting it to fit the
+        transport's frame-size limit.
+
+        The Noise transport caps a single frame at 65535 bytes, so a dense batch
+        can exceed it and ``write_message`` raises ``ValueError``. Left
+        unhandled that kills the flush task and the client silently stops
+        receiving *all* advertisements until it reconnects. Splitting keeps the
+        task alive and drops no advertisements. Plaintext has no cap, so the
+        common case sends exactly one frame.
+        """
+        if not batch:
+            return
+        resp = proto.encode_ble_raw_advertisements_response(batch)
+        try:
+            self._send_message(proto.MSG_BLE_RAW_ADVERTISEMENTS_RESPONSE, resp)
+        except ValueError:
+            if len(batch) == 1:
+                # A single BLE advertisement is tens of bytes and cannot exceed
+                # the frame limit; if one somehow does, drop it rather than
+                # recurse forever.
+                logger.warning(
+                    "Dropping an advertisement that exceeds the frame size "
+                    "limit (%d bytes)",
+                    len(resp),
+                )
+                return
+            mid = len(batch) // 2
+            self._flush_advertisements(batch[:mid])
+            self._flush_advertisements(batch[mid:])
 
     async def _cleanup(self) -> None:
         self._closed = True

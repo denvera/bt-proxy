@@ -344,3 +344,41 @@ class _NoiseClient:
         inner = self._bt_noise.encode_inner(msg_type, data)
         self.writer.write(self._bt_noise.encode_frame(self.proto.encrypt(inner)))
         await self.writer.drain()
+
+
+# ---------------------------------------------------------------------------
+# Oversized advertisement batch must be split, not dropped or fatal.
+# ---------------------------------------------------------------------------
+
+
+class _CappedTransport:
+    """A transport whose write_message rejects any single frame over ``cap``,
+    mimicking the Noise 65535-byte frame ceiling."""
+
+    def __init__(self, cap: int):
+        self.cap = cap
+        self.frames: list[tuple[int, bytes]] = []
+
+    def write_message(self, msg_type: int, data: bytes) -> None:
+        if len(data) > self.cap:
+            raise ValueError(f"frame too big: {len(data)} > {self.cap}")
+        self.frames.append((msg_type, data))
+
+
+@pytest.mark.asyncio
+async def test_oversized_adv_batch_is_split_not_dropped():
+    """A batch too large for one frame is split across frames with no losses;
+    the flush must not raise (which would kill _adv_flush_loop)."""
+    conn = api_server.APIConnection(MagicMock(), MagicMock(), MagicMock())
+    conn._transport = _CappedTransport(cap=1000)
+    conn._closed = False
+
+    batch = [(0x1000 + i, -60, 0, bytes([i % 256]) * 30) for i in range(100)]
+    conn._flush_advertisements(batch)  # must not raise
+
+    assert len(conn._transport.frames) >= 2  # actually split
+    delivered = 0
+    for _msg_type, data in conn._transport.frames:
+        assert len(data) <= 1000  # every frame fits
+        delivered += len(proto.decode_fields(data).get(1, []))
+    assert delivered == 100  # nothing dropped
