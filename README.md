@@ -72,9 +72,9 @@ key is set, the API is served in plaintext (see the deprecation notice below).
 > An unauthenticated proxy lets any device on your network connect, take full
 > control of your Bluetooth adapter (read/write arbitrary GATT characteristics on
 > nearby devices), and receive a live feed of every BLE advertisement in range.
-> Unauthenticated operation becomes opt-in and is **removed in 2.0**. This is
-> **opt-in**: upgrading alone changes nothing — if you upgrade and set no key you
-> remain exposed. **Set a key.**
+> Unauthenticated operation becomes **opt-in in 2.0**. This is **opt-in**:
+> upgrading alone changes nothing — if you upgrade and set no key you remain
+> exposed. **Set a key.**
 
 Generate a key:
 

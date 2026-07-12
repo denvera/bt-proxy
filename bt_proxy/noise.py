@@ -35,6 +35,12 @@ from noise.connection import NoiseConnection
 logger = logging.getLogger(__name__)
 
 # --- Wire protocol constants (external contract -- do not change) -----------
+#
+# Every constant below was read from the ESPHome/aioesphomeapi sources, not from
+# the Noise spec, and must match them byte for byte. Sources:
+#   https://github.com/esphome/esphome/blob/dev/esphome/components/api/api_frame_helper_noise.cpp
+#   https://github.com/esphome/aioesphomeapi/blob/main/aioesphomeapi/_frame_helper/noise.py
+# The module docstring above summarises the resulting wire format.
 
 NOISE_PROTOCOL_NAME = b"Noise_NNpsk0_25519_ChaChaPoly_SHA256"
 

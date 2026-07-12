@@ -35,7 +35,7 @@ UNENCRYPTED_WARNING = (
     "BLE advertisement in range. Set --encryption-key (or the "
     f"{ENCRYPTION_KEY_ENV_VAR} environment variable) to enable Noise "
     "encryption. Unauthenticated operation is DEPRECATED and will become "
-    "opt-in / be removed in 2.0."
+    "opt-in in 2.0."
 )
 
 
