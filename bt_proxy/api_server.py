@@ -269,13 +269,21 @@ class APIConnection:
             return
         handler, required = entry
         if self._state.value < required.value:
+            # A message arrived before the connection is authenticated. Close
+            # rather than silently ignore it: a client waiting for a reply would
+            # otherwise hang until its own timeout ("the proxy appears dead"),
+            # and silently dropping each message lets a peer flood the log with
+            # no bound. Closing gives a definitive EOF and caps this to one line
+            # per connection. (The standard Home Assistant flow sends
+            # ConnectRequest first and never trips this.)
             logger.warning(
                 "Client %s sent message type %d before authentication "
-                "(state=%s); refusing",
+                "(state=%s); closing the connection",
                 self._peer,
                 msg_type,
                 self._state.name,
             )
+            self._closed = True
             return
         await handler(self, data)
 

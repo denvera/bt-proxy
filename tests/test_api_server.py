@@ -382,3 +382,26 @@ async def test_oversized_adv_batch_is_split_not_dropped():
         assert len(data) <= 1000  # every frame fits
         delivered += len(proto.decode_fields(data).get(1, []))
     assert delivered == 100  # nothing dropped
+
+
+@pytest.mark.asyncio
+async def test_gated_message_before_auth_closes_connection():
+    """A gated (AUTHENTICATED-only) message sent before ConnectRequest must
+    close the connection (EOF) rather than leave the client hanging silently."""
+    ble = make_ble()
+    server, port = await start_server(ble, encryption_key=None)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        # Skip ConnectRequest; go straight to a gated subscribe.
+        writer.write(
+            proto.frame_message(
+                proto.MSG_SUBSCRIBE_BLE_ADVERTISEMENTS_REQUEST, b""
+            )
+        )
+        await writer.drain()
+        # Server refuses and closes -> EOF within the timeout, not a hang.
+        with pytest.raises((asyncio.IncompleteReadError, ConnectionResetError)):
+            await asyncio.wait_for(reader.readexactly(1), 2.0)
+        writer.close()
+    finally:
+        await server.stop()
