@@ -90,6 +90,11 @@ docker run -d \
 
 ## Running as a Service
 
+The unit runs the virtualenv that `uv sync` creates in `/opt/bt-proxy/.venv`, so
+`uv` doesn't need to be on root's `PATH`. If you cloned somewhere else, adjust
+`WorkingDirectory` and `ExecStart` to match. After pulling updates, re-run
+`uv sync` and restart the service.
+
 Copy the unit file and enable it:
 
 ```bash
