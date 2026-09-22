@@ -6,7 +6,7 @@ Wants=network-online.target bluetooth.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/bt-proxy
-ExecStart=uv run python -m bt_proxy --log-level INFO
+ExecStart=/opt/bt-proxy/.venv/bin/python -m bt_proxy --log-level INFO
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=15
