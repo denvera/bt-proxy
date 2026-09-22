@@ -18,6 +18,9 @@ from .ble_manager import BLEManager
 
 logger = logging.getLogger(__name__)
 
+UNKNOWN_MAC = "00:00:00:00:00:00"
+BT_MAC_RETRY_INTERVAL = 5.0
+
 
 def get_local_ip() -> str:
     """Get the primary local IP address."""
@@ -54,7 +57,27 @@ def get_bt_mac(adapter: str | None = None) -> str:
         with open("/sys/class/bluetooth/hci0/address") as f:
             return f.read().strip().upper()
     except Exception:
-        return "00:00:00:00:00:00"
+        return UNKNOWN_MAC
+
+
+async def wait_for_bt_mac(adapter: str | None = None) -> str:
+    """Block until the adapter MAC can be read.
+
+    The MAC is the device identity Home Assistant stores, so starting before
+    bluetoothd / the adapter is up and advertising 00:00:00:00:00:00 makes HA
+    flag the proxy as a conflicting device.
+    """
+    mac = get_bt_mac(adapter)
+    if mac != UNKNOWN_MAC:
+        return mac
+    logger.warning(
+        f"Bluetooth adapter MAC not available yet (is bluetoothd running and "
+        f"the adapter powered?); retrying every {int(BT_MAC_RETRY_INTERVAL)}s"
+    )
+    while mac == UNKNOWN_MAC:
+        await asyncio.sleep(BT_MAC_RETRY_INTERVAL)
+        mac = get_bt_mac(adapter)
+    return mac
 
 
 async def register_mdns(
@@ -87,7 +110,7 @@ async def register_mdns(
 
 async def async_main(args: argparse.Namespace) -> None:
     """Async main entry point."""
-    bt_mac = get_bt_mac(args.adapter)
+    bt_mac = await wait_for_bt_mac(args.adapter)
     logger.info("Bluetooth MAC: %s", bt_mac)
 
     ble_manager = BLEManager(
