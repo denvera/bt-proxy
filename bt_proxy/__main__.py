@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
+import ipaddress
 import logging
 import signal
 import socket
+import struct
 import subprocess
 
 from zeroconf import IPVersion
@@ -20,6 +23,49 @@ logger = logging.getLogger(__name__)
 
 UNKNOWN_MAC = "00:00:00:00:00:00"
 BT_MAC_RETRY_INTERVAL = 5.0
+
+
+def resolve_bind(bind: str) -> str:
+    """Resolve an IPv4 address or Linux interface's primary IPv4 at startup."""
+    try:
+        address = ipaddress.ip_address(bind)
+    except ValueError:
+        try:
+            socket.if_nametoindex(bind)
+        except OSError as exc:
+            raise ValueError(
+                f"{bind!r} is not a valid IP address or an existing interface"
+            ) from exc
+
+        # Linux SIOCGIFADDR returns the interface's primary IPv4 address.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            try:
+                result = fcntl.ioctl(
+                    sock.fileno(), 0x8915, struct.pack("256s", bind.encode())
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"Cannot get IPv4 address for interface {bind!r}: {exc}"
+                ) from exc
+        address = ipaddress.IPv4Address(result[20:24])
+
+    if not isinstance(address, ipaddress.IPv4Address):
+        raise ValueError("--bind supports IPv4 addresses only")
+    if (
+        address.is_unspecified
+        or address.is_multicast
+        or str(address) == "255.255.255.255"
+    ):
+        raise ValueError("--bind requires a specific local unicast IPv4 address")
+
+    # Reject unavailable addresses before waiting for Bluetooth or advertising.
+    local_ip = str(address)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((local_ip, 0))
+        except OSError as exc:
+            raise ValueError(f"Cannot bind to {local_ip}: {exc}") from exc
+    return local_ip
 
 
 def get_local_ip() -> str:
@@ -81,10 +127,10 @@ async def wait_for_bt_mac(adapter: str | None = None) -> str:
 
 
 async def register_mdns(
-    name: str, port: int, mac: str
+    name: str, port: int, mac: str, bind_address: str | None = None
 ) -> tuple[AsyncZeroconf, AsyncServiceInfo]:
     """Register the service via mDNS so Home Assistant can discover it."""
-    local_ip = get_local_ip()
+    local_ip = bind_address if bind_address is not None else get_local_ip()
     logger.info("Advertising mDNS on %s:%d", local_ip, port)
 
     # ESPHome devices advertise as _esphomelib._tcp.local.
@@ -103,13 +149,18 @@ async def register_mdns(
         server=f"{name}.local.",
     )
 
-    zc = AsyncZeroconf(ip_version=IPVersion.V4Only)
+    if bind_address is None:
+        zc = AsyncZeroconf(ip_version=IPVersion.V4Only)
+    else:
+        zc = AsyncZeroconf(interfaces=[bind_address], ip_version=IPVersion.V4Only)
     await zc.async_register_service(info)
     return zc, info
 
 
 async def async_main(args: argparse.Namespace) -> None:
     """Async main entry point."""
+    if args.bind_address is not None:
+        logger.info("Network bind: %s -> %s", args.bind, args.bind_address)
     bt_mac = await wait_for_bt_mac(args.adapter)
     logger.info("Bluetooth MAC: %s", bt_mac)
 
@@ -125,10 +176,13 @@ async def async_main(args: argparse.Namespace) -> None:
         mac_address=bt_mac,
         bt_mac_address=bt_mac,
         port=args.port,
+        host=args.bind_address or "0.0.0.0",
     )
 
     # Register mDNS
-    zc, service_info = await register_mdns(args.name, args.port, bt_mac)
+    zc, service_info = await register_mdns(
+        args.name, args.port, bt_mac, args.bind_address
+    )
 
     # Start BLE scanning
     await ble_manager.start_scanning()
@@ -176,6 +230,16 @@ def main() -> None:
         help="API server port (default: 6053)",
     )
     parser.add_argument(
+        "--bind",
+        default=None,
+        metavar="IPV4_OR_INTERFACE",
+        help=(
+            "Bind the API and mDNS to an IPv4 address or Linux interface "
+            "(e.g. 10.5.1.5 or enp3s0). Interface names use their primary IPv4 "
+            "at startup. Default: all IPv4 interfaces."
+        ),
+    )
+    parser.add_argument(
         "--max-connections",
         type=int,
         default=3,
@@ -194,6 +258,10 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    try:
+        args.bind_address = resolve_bind(args.bind) if args.bind is not None else None
+    except ValueError as exc:
+        parser.error(str(exc))
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

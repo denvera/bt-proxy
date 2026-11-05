@@ -569,6 +569,7 @@ class APIServer:
         mac_address: str = "",
         bt_mac_address: str = "",
         port: int = 6053,
+        host: str = "0.0.0.0",
     ):
         self.ble_manager = ble_manager
         self.name = name
@@ -576,6 +577,7 @@ class APIServer:
         self.mac_address = mac_address
         self.bt_mac_address = bt_mac_address
         self.port = port
+        self.host = host
         self._connections: list[APIConnection] = []
         self._server: asyncio.Server | None = None
 
@@ -590,9 +592,9 @@ class APIServer:
         )
 
         self._server = await asyncio.start_server(
-            self._handle_client, "0.0.0.0", self.port
+            self._handle_client, self.host, self.port
         )
-        logger.info("API server listening on port %d", self.port)
+        logger.info("API server listening on %s:%d", self.host, self.port)
 
     async def stop(self) -> None:
         """Stop the server and close all connections."""
