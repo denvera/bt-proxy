@@ -19,3 +19,11 @@ bt-proxy = "bt_proxy.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["bt_proxy*"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = [".venv", ".git", "*.egg"]

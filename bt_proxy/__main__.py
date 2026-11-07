@@ -17,7 +17,7 @@ from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 
 from . import EMULATED_ESPHOME_VERSION
 from .api_server import APIServer
-from .ble_manager import BLEManager
+from .ble_manager import ADVERT_SILENCE_TIMEOUT, BLEManager
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,7 @@ async def async_main(args: argparse.Namespace) -> None:
     ble_manager = BLEManager(
         max_connections=args.max_connections,
         adapter=args.adapter,
+        advert_timeout=args.advert_timeout,
     )
 
     server = APIServer(
@@ -212,6 +213,17 @@ async def async_main(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="ESPHome-compatible Bluetooth Proxy for Raspberry Pi"
+    )
+    parser.add_argument(
+        "--advert-timeout",
+        type=float,
+        default=ADVERT_SILENCE_TIMEOUT,
+        help=(
+            "Seconds of advertisement silence that mean the scanner has stopped "
+            f"receiving even though it reports running (default: "
+            f"{ADVERT_SILENCE_TIMEOUT:.0f}). 0 disables the watchdog — use that only "
+            "on a site so quiet that no BLE device advertises within the window."
+        ),
     )
     parser.add_argument(
         "--name",
