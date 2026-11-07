@@ -42,6 +42,7 @@ uv run python -m bt_proxy
 | `--port` | `6053` | API server TCP port |
 | `--max-connections` | `3` | Max concurrent BLE GATT connections |
 | `--adapter` | system default | Bluetooth adapter (e.g. `hci0`) |
+| `--advert-timeout` | `300` | Seconds of advertisement silence that count as a dead scanner. `0` disables the watchdog |
 | `--log-level` | `INFO` | Logging verbosity |
 
 ### Example
@@ -49,6 +50,30 @@ uv run python -m bt_proxy
 ```bash
 uv run python -m bt_proxy --name living-room-proxy --friendly-name "Living Room BT Proxy" --log-level DEBUG
 ```
+
+### Scanner liveness
+
+A scanner start that BlueZ accepts does not prove the radio is receiving. The proxy can
+report `RUNNING` while it gets no advertisements, for example when a controller accepts
+the start and then delivers nothing, or when `bluetoothd` restarts underneath a running
+scanner. Home Assistant then keeps counting the proxy as a Bluetooth source. Two checks
+cover this:
+
+- **Advertisement watchdog.** Each advertisement records a monotonic timestamp. A
+  watchdog checks every 30 s. After `--advert-timeout` seconds (default 300) with no
+  advertisement while the scanner should be running, it tears the scanner down, reports
+  `SCANNER_STATE_FAILED`, and hands over to the existing re-arm loop. Advertisements count
+  even when no client is connected. A deliberate stop (shutdown, or the stop and start
+  inside a scan-mode change) cancels the watchdog, so a mode switch is not mistaken for a
+  dead radio. `--advert-timeout 0` disables it; use that only where no BLE device is
+  expected to advertise within the window.
+- **Adapter power.** BlueZ accepts a passive-scan request against an unpowered adapter,
+  then fails to register the advertisement monitor (`Failed to Add Adv Patterns Monitor
+  with status 0x0a`, MGMT_STATUS_NOT_POWERED). That failure never reaches the client, and
+  bleak's `start()` returns normally. So after a successful start the proxy reads the
+  adapter's `Powered` property over D-Bus and reports `SCANNER_STATE_FAILED` instead of
+  `RUNNING` when it is false. The query is best-effort and time-bounded. If it cannot be
+  answered (no dbus-fast, no D-Bus, a timeout), the scanner is treated as working.
 
 ## How It Works
 
@@ -270,4 +295,13 @@ bt_proxy/
 ├── proto.py           # Protobuf encoding/decoding, message IDs, wire protocol
 ├── ble_manager.py     # BLE scanning and GATT connections (bleak)
 └── api_server.py      # ESPHome Native API TCP server
+
+tests/                 # pytest; no radio needed
+```
+
+## Tests
+
+```bash
+pip install -e '.[test]'
+pytest
 ```

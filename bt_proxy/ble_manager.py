@@ -32,6 +32,13 @@ except ImportError:  # pragma: no cover - older bleak layout
         OrPattern,
     )
 
+try:  # bleak's own dependency on Linux; absent elsewhere, and then we simply
+    # cannot answer "is the adapter powered?" and never pretend to.
+    from dbus_fast import BusType, Message, MessageType
+    from dbus_fast.aio import MessageBus
+except ImportError:  # pragma: no cover - non-BlueZ platforms
+    MessageBus = None  # type: ignore[assignment,misc]
+
 from . import proto
 
 logger = logging.getLogger(__name__)
@@ -44,6 +51,11 @@ MTU_ACQUIRE_TIMEOUT = 10.0
 CONNECT_TIMEOUT = 30.0
 CONNECT_RETRY_DELAY = 2.0
 CONNECT_MAX_RETRIES = 3
+
+# How long to wait on D-Bus when asking BlueZ whether the adapter is powered.
+# Short: the answer is only used to refuse a false "running", and a wedged
+# bluetoothd is exactly when this call hangs, so it must not delay the start.
+ADAPTER_POWER_QUERY_TIMEOUT = 5.0
 
 # Per-device connect-failure backoff. Home Assistant retries failed connections
 # aggressively; without a brake we relay every retry straight to BlueZ and the
@@ -73,6 +85,20 @@ SCAN_START_RETRY_DELAY = 2.0
 # self-heals from a transient failure (or a manual adapter reset) without
 # hammering the controller.
 SCAN_REARM_INTERVAL = 60.0
+
+# A scanner that BlueZ ACCEPTED is not a scanner that is working. StartDiscovery can
+# return success while the controller delivers nothing at all: a controller whose firmware
+# handshake fails ("Reading QCA version information failed (-110)") still accepts the call,
+# and so does one whose single discovery session another scanner stack has taken over.
+# Setting `_scanning` from the start call alone therefore makes a dead radio
+# indistinguishable from a quiet one — the proxy reports RUNNING, the re-arm loop exits
+# satisfied, and nothing further is logged. So liveness is measured from advertisements
+# arriving, not from the API call returning: if none arrive for this long while we believe
+# we are scanning, tear the scanner down and re-arm it. Generous by default — anywhere with
+# BLE traffic sees a stray advertisement every few seconds, but a genuinely isolated site
+# might not. 0 disables the watchdog.
+ADVERT_SILENCE_TIMEOUT = 300.0
+ADVERT_WATCHDOG_INTERVAL = 30.0
 
 # Passive scanning via the BlueZ AdvertisementMonitor1 D-Bus interface needs
 # BlueZ >= 5.56 (and the daemon started with --experimental). On older BlueZ
@@ -383,7 +409,12 @@ def _bleak_props_to_int(properties: list[str]) -> int:
 class BLEManager:
     """Manages BLE scanning and active connections."""
 
-    def __init__(self, max_connections: int = 3, adapter: str | None = None):
+    def __init__(
+        self,
+        max_connections: int = 3,
+        adapter: str | None = None,
+        advert_timeout: float = ADVERT_SILENCE_TIMEOUT,
+    ):
         self.max_connections = max_connections
         self._adapter = adapter
         self._connections: dict[int, BLEConnection] = {}
@@ -408,6 +439,11 @@ class BLEManager:
         self._scanning = False
         # Background task that slowly re-arms the scanner after a failed start.
         self._scan_rearm_task: asyncio.Task | None = None
+        # Advertisement watchdog: proves the scanner is actually receiving, not just
+        # that BlueZ accepted the start call. See ADVERT_SILENCE_TIMEOUT.
+        self._advert_timeout = advert_timeout
+        self._last_advert = 0.0
+        self._advert_watchdog_task: asyncio.Task | None = None
         self._adv_callback: Callable[
             [int, int, int, bytes], None
         ] | None = None
@@ -441,6 +477,11 @@ class BLEManager:
         self, device: BLEDevice, advertisement_data: AdvertisementData
     ) -> None:
         """Called by BleakScanner for each advertisement."""
+        # The watchdog's only evidence that the radio is alive. Stamped before the
+        # early return below, so a proxy with no client attached still counts as
+        # receiving rather than looking silent.
+        self._last_advert = time.monotonic()
+
         # Cache the BLEDevice object for use in connections
         self._device_cache[device.address.upper()] = device
 
@@ -544,16 +585,95 @@ class BLEManager:
                     f"restarting bluetoothd is not enough. Will re-try every "
                     f"{int(SCAN_REARM_INTERVAL)}s."
                 )
-            await self._teardown_scanner()
-            self._scanning = False
-            if self._scanner_state_callback:
-                self._scanner_state_callback(proto.SCANNER_STATE_FAILED)
-            self._schedule_scan_rearm()
+            await self._fail_scanner_start()
+            return
+
+        # A start that returned cleanly is not proof of a working radio — see
+        # _adapter_powered. Refuse to report RUNNING for an unpowered one.
+        if await self._adapter_powered() is False:
+            adapter = self._adapter or "hci0"
+            logger.error(
+                f"BLE scanner start reported success but {adapter} is NOT "
+                f"POWERED, so it cannot receive anything — refusing to report "
+                f"this proxy as running. BlueZ accepts the request and then "
+                f"rejects the advertisement monitor with "
+                f"MGMT_STATUS_NOT_POWERED, which never reaches us. On the host "
+                f"check 'rfkill list' and power it on ('sudo hciconfig "
+                f"{adapter} up' or 'bluetoothctl power on'). Will re-try every "
+                f"{int(SCAN_REARM_INTERVAL)}s."
+            )
+            await self._fail_scanner_start()
             return
 
         self._scanning = True
+        # Give the fresh scanner a full silence budget before the watchdog may judge it.
+        self._last_advert = time.monotonic()
+        self._start_advert_watchdog()
         if self._scanner_state_callback:
             self._scanner_state_callback(proto.SCANNER_STATE_RUNNING)
+
+    async def _fail_scanner_start(self) -> None:
+        """Tear down, report FAILED to the client, and re-arm slowly.
+
+        Shared by both ways a start can fail: an exception from BlueZ, and a
+        start that "succeeded" against an adapter that is not powered.
+        """
+        await self._teardown_scanner()
+        self._scanning = False
+        if self._scanner_state_callback:
+            self._scanner_state_callback(proto.SCANNER_STATE_FAILED)
+        self._schedule_scan_rearm()
+
+    async def _adapter_powered(self) -> bool | None:
+        """Is the controller actually powered? None when we cannot tell.
+
+        This exists because a scanner start is not proof of a working radio.
+        BlueZ accepts a passive-scan request against an unpowered adapter and
+        then refuses to register the advertisement monitor —
+        `Failed to Add Adv Patterns Monitor with status 0x0a`
+        (MGMT_STATUS_NOT_POWERED) — and that refusal never reaches the client.
+        bleak's start() returns cleanly, so without this check the proxy
+        reports RUNNING for a radio that can never deliver an advertisement,
+        and Home Assistant goes on routing connections to it. Unchecked, a dead
+        controller goes on looking healthy indefinitely.
+
+        Best-effort by design: any failure to ask returns None, and a None
+        never blocks a scanner that is otherwise working.
+        """
+        if MessageBus is None:
+            return None
+        adapter = self._adapter or "hci0"
+        bus = None
+        try:
+            bus = await asyncio.wait_for(
+                MessageBus(bus_type=BusType.SYSTEM).connect(),
+                timeout=ADAPTER_POWER_QUERY_TIMEOUT,
+            )
+            reply = await asyncio.wait_for(
+                bus.call(
+                    Message(
+                        destination="org.bluez",
+                        path=f"/org/bluez/{adapter}",
+                        interface="org.freedesktop.DBus.Properties",
+                        member="Get",
+                        signature="ss",
+                        body=["org.bluez.Adapter1", "Powered"],
+                    )
+                ),
+                timeout=ADAPTER_POWER_QUERY_TIMEOUT,
+            )
+            if reply is None or reply.message_type is MessageType.ERROR:
+                return None
+            return bool(reply.body[0].value)
+        except Exception as e:
+            logger.debug("Could not read adapter power state: %s", e)
+            return None
+        finally:
+            if bus is not None:
+                try:
+                    bus.disconnect()
+                except Exception:
+                    pass
 
     async def _start_scanner(self, passive: bool) -> None:
         """Create and start a BleakScanner in the given mode."""
@@ -614,6 +734,65 @@ class BLEManager:
             await scanner.stop()
         except Exception:
             pass
+
+    def _start_advert_watchdog(self) -> None:
+        """Ensure a single watchdog task is checking that advertisements arrive."""
+        if self._advert_timeout <= 0:
+            return
+        if self._advert_watchdog_task is None or self._advert_watchdog_task.done():
+            self._advert_watchdog_task = asyncio.ensure_future(
+                self._advert_watchdog_loop()
+            )
+
+    def _cancel_advert_watchdog(self) -> None:
+        task = self._advert_watchdog_task
+        self._advert_watchdog_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _advert_watchdog_loop(self) -> None:
+        """Tear the scanner down if it stops receiving while claiming to run.
+
+        `start_scanning` sets `_scanning` when StartDiscovery succeeds, which on its own
+        leaves a controller that accepted the call and then delivered nothing
+        indistinguishable from a healthy one — to this process, to Home Assistant, and to
+        anything downstream reading the proxy's scanner state. This is what tells them
+        apart.
+
+        On a trip we report FAILED (so the client stops trusting this proxy) and hand
+        over to the ordinary re-arm loop rather than restarting here, keeping one recovery
+        path instead of two. If the controller is wedged at the HCI level the re-arm will
+        keep failing loudly, which is the correct outcome — that needs an adapter reset,
+        not a retry.
+        """
+        try:
+            while True:
+                await asyncio.sleep(ADVERT_WATCHDOG_INTERVAL)
+                if not self._scanning or self._advert_timeout <= 0:
+                    continue
+                silent_for = time.monotonic() - self._last_advert
+                if silent_for < self._advert_timeout:
+                    continue
+                adapter = self._adapter or "hci0"
+                logger.error(
+                    f"No BLE advertisement in {int(silent_for)}s while the scanner "
+                    f"reported running — the controller has stopped receiving. "
+                    f"Tearing the scanner down and re-arming every "
+                    f"{int(SCAN_REARM_INTERVAL)}s. If this repeats, {adapter} is wedged "
+                    f"and needs an adapter reset (see the start-failure message); "
+                    f"--advert-timeout 0 disables this check."
+                )
+                await self._teardown_scanner()
+                self._scanning = False
+                if self._scanner_state_callback:
+                    self._scanner_state_callback(proto.SCANNER_STATE_FAILED)
+                self._schedule_scan_rearm()
+                return
+        finally:
+            # Only clear our own handle: a cancelled watchdog can finish after a
+            # restart has already started its replacement.
+            if self._advert_watchdog_task is asyncio.current_task():
+                self._advert_watchdog_task = None
 
     def _schedule_scan_rearm(self) -> None:
         """Ensure a single background task is slowly re-arming the scanner."""
@@ -684,6 +863,9 @@ class BLEManager:
             return
 
         logger.info("Stopping BLE scanner")
+        # A deliberate stop (shutdown, or the mode switch in set_scan_mode) must not look
+        # like a silent radio to the watchdog.
+        self._cancel_advert_watchdog()
         if self._scanner_state_callback:
             self._scanner_state_callback(proto.SCANNER_STATE_STOPPING)
 
@@ -888,6 +1070,7 @@ class BLEManager:
         if self._scan_rearm_task is not None:
             self._scan_rearm_task.cancel()
             self._scan_rearm_task = None
+        self._cancel_advert_watchdog()
         for conn in list(self._connections.values()):
             try:
                 await conn.disconnect()
