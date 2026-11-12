@@ -155,6 +155,11 @@ class BLEConnection:
         return self._mtu_size
 
     def _disconnected_callback(self, client: BleakClient) -> None:
+        if client is not self.client:
+            # A late callback from an earlier connect attempt's client must not
+            # tear down the live one.
+            logger.info("Ignoring stale disconnect callback for %s", self.mac)
+            return
         logger.info("Device %s disconnected", self.mac)
         self._notify_handles.clear()
         self._on_disconnect(self.address)
@@ -704,6 +709,17 @@ class BLEManager:
 
     def _handle_disconnect(self, address: int) -> None:
         """Internal disconnect handler."""
+        if address in self._connecting:
+            # A failed attempt fires the disconnect callback mid-retry. Popping the
+            # connection here and telling HA "disconnected" would leave a later
+            # successful attempt untracked, so HA's disconnect finds nothing and
+            # BlueZ holds the link indefinitely. connect_device() reports the real
+            # outcome to HA instead.
+            logger.info(
+                "Disconnect during connect attempt for %s - left to the retry loop",
+                proto.int_to_mac(address),
+            )
+            return
         conn = self._connections.pop(address, None)
         if conn:
             # Schedule BlueZ cleanup in background
@@ -803,6 +819,9 @@ class BLEManager:
             for attempt in range(1, CONNECT_MAX_RETRIES + 1):
                 try:
                     await conn.connect(ble_device)
+                    # Re-track it, in case anything dropped it from the table
+                    # during the retries.
+                    self._connections[address] = conn
                     # Success clears any backoff and the wedge latch.
                     self._connect_backoff.pop(address, None)
                     self._daemon_wedge_logged = False
@@ -839,6 +858,10 @@ class BLEManager:
             # All retries exhausted — record the failure and arm the backoff.
             self._note_connect_failure(address, mac, last_error)
             self._connections.pop(address, None)
+            # Don't leave a half-made link behind in BlueZ (skipped when the
+            # daemon is wedged - bluetoothctl would hang).
+            if last_error is None or not _is_daemon_wedge_error(last_error):
+                await self._bluez_clear_state(mac)
             return False, 0, -1
         finally:
             self._connecting.discard(address)
@@ -875,6 +898,10 @@ class BLEManager:
             await conn.disconnect()
             # Also clear BlueZ state to prevent InProgress on next connect
             await self._bluez_clear_state(conn.mac)
+        else:
+            # HA asked for a disconnect we have no record of - make sure BlueZ
+            # isn't still holding the link.
+            await self._bluez_clear_state(proto.int_to_mac(address))
 
     def get_connection(self, address: int) -> BLEConnection | None:
         """Get an active connection by address."""
