@@ -18,8 +18,8 @@ services:
       # BlueZ of the host
       - /var/run/dbus:/var/run/dbus
     # The proxy has no environment variables, only command line options, so the entrypoint passes the values of the
-    # .env as options. Unless set, the device name follows the linux-voice-assistant with BLE at the end,
-    # lva-<mac>-ble, and the friendly name is "BT-Proxy - <mac> BLE". <mac> is the MAC address (without colons) of the
+    # .env as options. Unless set, the device name is
+    # ble-<mac> and the friendly name is "BT-Proxy - <mac> BLE". <mac> is the MAC address (without colons) of the
     # default network interface of the host, or the hostname if there is none. A Bluetooth adapter that is soft-blocked by rfkill (the
     # state on a fresh install) is unblocked first, through /dev/rfkill of the privileged container, see
     # BT_PROXY_RFKILL_UNBLOCK. The $$ is Compose escaping, the shell sees a single $.
@@ -35,7 +35,7 @@ services:
         id=$$(tr -d ':' < "/sys/class/net/$$iface/address" 2>/dev/null)
         id=$${id:-$$(hostname)}
         exec bt-proxy \
-          --name "$${BT_PROXY_NAME:-lva-$$id-ble}" \
+          --name "$${BT_PROXY_NAME:-ble-$$id}" \
           --friendly-name "$${BT_PROXY_FRIENDLY_NAME:-BT-Proxy - $$id BLE}" \
           --port "$${BT_PROXY_PORT:-6054}" \
           --max-connections "$${BT_PROXY_MAX_CONNECTIONS:-3}" \
