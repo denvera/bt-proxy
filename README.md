@@ -98,7 +98,7 @@ docker compose up -d
 ```
 
 The options of the `.env` are passed to `bt-proxy` as command line options. Unless `BT_PROXY_NAME` and
-`BT_PROXY_FRIENDLY_NAME` are set, the device name is `lva-<mac>-ble` and the friendly name `LVA - <mac> BLE`, with
+`BT_PROXY_FRIENDLY_NAME` are set, the device name is `lva-<mac>-ble` and the friendly name `BT-Proxy - <mac> BLE`, with
 the MAC address of the default network interface of the host. The API listens on port 6054 by default, so the proxy can run on
 the same host as the [Linux Voice Assistant](https://github.com/OHF-Voice/linux-voice-assistant), which uses 6053.
 Unless `BT_PROXY_RFKILL_UNBLOCK` is `false`, the container unblocks a Bluetooth adapter that is soft-blocked by
