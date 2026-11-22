@@ -1,0 +1,42 @@
+---
+services:
+  # ESPHome-compatible Bluetooth proxy, see https://github.com/denvera/bt-proxy
+  # It appears in Home Assistant like an ESP32 Bluetooth proxy (ESPHome integration, plaintext API, no encryption).
+  bt-proxy:
+    container_name: bt-proxy
+    image: "${BT_PROXY_IMAGE:-ghcr.io/denvera/bt-proxy}:${BT_PROXY_IMAGE_TAG:-latest}"
+    restart: unless-stopped
+    # mDNS discovery and the API port need the network of the host
+    network_mode: "host"
+    # Access to the Bluetooth adapter, as documented by the project. The BlueZ of the host is reached over D-Bus.
+    privileged: true
+    env_file: ${ENV_FILE:-.env}
+    volumes:
+      # Time and zone
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      # BlueZ of the host
+      - /var/run/dbus:/var/run/dbus
+    # The proxy has no environment variables, only command line options, so the entrypoint passes the values of the
+    # .env as options. Unless set, the device name is
+    # ble-<mac> and the friendly name is "BT-Proxy - <mac>". <mac> is the MAC address (without colons) of the
+    # default network interface of the host, or the hostname if there is none. A Bluetooth adapter that is soft-blocked by rfkill (the
+    # state on a fresh install) is unblocked first, through /dev/rfkill of the privileged container, see
+    # BT_PROXY_RFKILL_UNBLOCK. The $$ is Compose escaping, the shell sees a single $.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ "$${BT_PROXY_RFKILL_UNBLOCK:-true}" = "true" ]; then
+          python3 -c 'import struct; open("/dev/rfkill", "wb", buffering=0).write(struct.pack("IBBBB", 0, 2, 3, 0, 0))' || true
+          bluetoothctl power on >/dev/null 2>&1 || true
+        fi
+        iface=$$(awk '$$2=="00000000" {print $$1; exit}' /proc/net/route)
+        id=$$(tr -d ':' < "/sys/class/net/$$iface/address" 2>/dev/null)
+        id=$${id:-$$(hostname)}
+        exec bt-proxy \
+          --name "$${BT_PROXY_NAME:-ble-$$id}" \
+          --friendly-name "$${BT_PROXY_FRIENDLY_NAME:-BT-Proxy - $$id}" \
+          --port "$${BT_PROXY_PORT:-6054}" \
+          --max-connections "$${BT_PROXY_MAX_CONNECTIONS:-3}" \
+          --log-level "$${BT_PROXY_LOG_LEVEL:-INFO}"

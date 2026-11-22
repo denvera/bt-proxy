@@ -88,6 +88,22 @@ docker run -d \
 
 > `--net=host` is required for mDNS discovery. `--privileged` grants access to the Bluetooth adapter — alternatively use `--cap-add=NET_ADMIN --cap-add=NET_RAW` with explicit device mounts.
 
+### Docker Compose
+
+`docker-compose.yml` and `.env.example` in this repository run the image with Docker Compose:
+
+```bash
+cp .env.example .env    # optional, every option has a default
+docker compose up -d
+```
+
+The options of the `.env` are passed to `bt-proxy` as command line options. Unless `BT_PROXY_NAME` and
+`BT_PROXY_FRIENDLY_NAME` are set, the device name is `ble-<mac>` and the friendly name `BT-Proxy - <mac>`, with
+the MAC address of the default network interface of the host. The API listens on port 6054 by default, so the proxy can run on
+the same host as the [Linux Voice Assistant](https://github.com/OHF-Voice/linux-voice-assistant), which uses 6053.
+Unless `BT_PROXY_RFKILL_UNBLOCK` is `false`, the container unblocks a Bluetooth adapter that is soft-blocked by
+rfkill (see below) through `/dev/rfkill` and powers it on before the proxy starts.
+
 ## Running as a Service
 
 The unit runs the virtualenv that `uv sync` creates in `/opt/bt-proxy/.venv`, so
