@@ -41,7 +41,7 @@ uv run python -m bt_proxy
 | `--friendly-name` | `Bluetooth Proxy` | Human-readable name |
 | `--port` | `6053` | API server TCP port |
 | `--max-connections` | `3` | Max concurrent BLE GATT connections |
-| `--adapter` | system default | Bluetooth adapter (e.g. `hci0`) |
+| `--adapter` | system default | Bluetooth adapter (e.g. `hci0`). Its MAC is the proxy's identity in Home Assistant; set it on hosts with more than one controller |
 | `--log-level` | `INFO` | Logging verbosity |
 
 ### Example
