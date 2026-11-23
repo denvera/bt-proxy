@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 license = {text = "MIT"}
 dependencies = [
     "bleak>=0.21.0",
+    "dbus-fast>=1.83.0",
     "zeroconf>=0.80.0",
 ]
 

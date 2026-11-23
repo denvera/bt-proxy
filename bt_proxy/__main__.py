@@ -12,6 +12,8 @@ import socket
 import struct
 import subprocess
 
+from dbus_fast import BusType, Message, MessageType
+from dbus_fast.aio import MessageBus
 from zeroconf import IPVersion
 from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
 
@@ -81,7 +83,13 @@ def get_local_ip() -> str:
 
 
 def get_bt_mac(adapter: str | None = None) -> str:
-    """Get the Bluetooth adapter MAC address."""
+    """Get the MAC address of bluetoothd's default controller.
+
+    Only meaningful without ``--adapter``: ``bluetoothctl show`` reports the
+    *default* controller, which on a host with several radios is not
+    necessarily the one bt-proxy scans with. For a named adapter use
+    :func:`get_adapter_mac`.
+    """
     try:
         result = subprocess.run(
             ["bluetoothctl", "show"],
@@ -106,23 +114,65 @@ def get_bt_mac(adapter: str | None = None) -> str:
         return UNKNOWN_MAC
 
 
+async def get_adapter_mac(adapter: str) -> str:
+    """Get the address of the named BlueZ adapter (e.g. ``hci1``) over D-Bus.
+
+    Returns UNKNOWN_MAC while bluetoothd or that adapter is not available, so
+    the caller keeps waiting for *this* adapter instead of falling back to
+    another controller (which would hand Home Assistant a different identity).
+    """
+    try:
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    except OSError:
+        # The system bus socket can be missing or refuse us at runtime (e.g.
+        # not mounted into a container yet); there is nothing to check first.
+        return UNKNOWN_MAC
+    try:
+        reply = await bus.call(
+            Message(
+                destination="org.bluez",
+                path=f"/org/bluez/{adapter}",
+                interface="org.freedesktop.DBus.Properties",
+                member="Get",
+                signature="ss",
+                body=["org.bluez.Adapter1", "Address"],
+            )
+        )
+    finally:
+        bus.disconnect()
+    if reply is None or reply.message_type != MessageType.METHOD_RETURN:
+        # bluetoothd not running, or it does not know this adapter (yet)
+        return UNKNOWN_MAC
+    return str(reply.body[0].value).upper()
+
+
+async def read_bt_mac(adapter: str | None = None) -> str:
+    """MAC that identifies this proxy: the named adapter's, else the default's."""
+    if adapter:
+        return await get_adapter_mac(adapter)
+    return get_bt_mac()
+
+
 async def wait_for_bt_mac(adapter: str | None = None) -> str:
     """Block until the adapter MAC can be read.
 
     The MAC is the device identity Home Assistant stores, so starting before
     bluetoothd / the adapter is up and advertising 00:00:00:00:00:00 makes HA
-    flag the proxy as a conflicting device.
+    flag the proxy as a conflicting device. With ``--adapter`` it waits for
+    that adapter's own address: on a host with several controllers, the
+    default controller's MAC would make HA reject the proxy (issue #14).
     """
-    mac = get_bt_mac(adapter)
+    mac = await read_bt_mac(adapter)
     if mac != UNKNOWN_MAC:
         return mac
     logger.warning(
-        f"Bluetooth adapter MAC not available yet (is bluetoothd running and "
-        f"the adapter powered?); retrying every {int(BT_MAC_RETRY_INTERVAL)}s"
+        f"Bluetooth adapter {adapter or '(default)'} MAC not available yet (is "
+        f"bluetoothd running and the adapter present and powered?); retrying "
+        f"every {int(BT_MAC_RETRY_INTERVAL)}s"
     )
     while mac == UNKNOWN_MAC:
         await asyncio.sleep(BT_MAC_RETRY_INTERVAL)
-        mac = get_bt_mac(adapter)
+        mac = await read_bt_mac(adapter)
     return mac
 
 
