@@ -261,6 +261,27 @@ sudo systemctl enable --now bt-proxy-watchdog.timer
 > how you run the proxy. Under Docker, point it at the container logs instead,
 > e.g. `docker logs --since 3m bt-proxy 2>&1 | grep -q ...`.
 
+## Connection cleanup and regression tests
+
+A Bluetooth link ending does not necessarily mean that the client's local
+D-Bus connection has been released. The proxy explicitly awaits Bleak's
+`disconnect()` even after `is_connected` becomes false. It also cleans up failed
+or cancelled connection attempts before retrying, and ignores stale callbacks
+from superseded clients so they cannot untrack a new connection.
+
+Run the hardware-independent lifecycle regression tests from the repository root:
+
+```bash
+uv run python -B -m unittest discover -s tests -v
+```
+
+`uv run` uses the project's Python environment; `-B` suppresses bytecode files;
+`-m unittest discover` runs Python's built-in test discovery; `-s tests` selects
+the tests directory; `-v` prints individual test results. No Bluetooth adapter,
+BlueZ daemon, or Home Assistant connection is needed. The tests include 300
+simulated peripheral disconnects, failed retries, cancellation, and stale
+callbacks, checking that client resources are released.
+
 ## Architecture
 
 ```

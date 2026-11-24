@@ -145,6 +145,7 @@ class BLEConnection:
         self._on_disconnect = on_disconnect
         self._on_notify = on_notify
         self._notify_handles: set[int] = set()
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     @property
     def connected(self) -> bool:
@@ -155,8 +156,14 @@ class BLEConnection:
         return self._mtu_size
 
     def _disconnected_callback(self, client: BleakClient) -> None:
+        # A superseded client's late callback must not remove the new link.
+        if client is not self.client or self._cleanup_task is not None:
+            return
         logger.info("Device %s disconnected", self.mac)
         self._notify_handles.clear()
+        # Bleak 3 keeps its D-Bus socket after a peripheral disconnect until
+        # disconnect() is explicitly awaited, even when is_connected is false.
+        self._cleanup_task = asyncio.create_task(self._disconnect_client(client))
         self._on_disconnect(self.address)
 
     async def connect(self, ble_device: BLEDevice | None = None) -> None:
@@ -165,6 +172,8 @@ class BLEConnection:
         If ble_device is provided (from scanner cache), use it directly.
         Otherwise fall back to MAC string.
         """
+        # Finish the previous attempt's bus cleanup before replacing its client.
+        await self.disconnect()
         logger.info("Connecting to %s", self.mac)
         target: BLEDevice | str = ble_device if ble_device else self.mac
         self.client = BleakClient(
@@ -172,18 +181,23 @@ class BLEConnection:
             disconnected_callback=self._disconnected_callback,
             timeout=CONNECT_TIMEOUT,
         )
-        await self.client.connect()
-        await self._acquire_mtu()
-        # A genuine connection is actually connected once connect() returns.
-        # If BlueZ reports success but the link isn't really up (a phantom
-        # connection — typically when bluetoothd is wedged and holding stale
-        # state), treat it as a failure so the caller backs off instead of
-        # "succeeding" with a dead handle that fails every subsequent GATT op.
-        if not self.client.is_connected:
-            raise BleakError(
-                f"phantom connection to {self.mac}: BlueZ reported success "
-                f"but the device is not connected"
-            )
+        try:
+            await self.client.connect()
+            await self._acquire_mtu()
+            # A genuine connection is actually connected once connect() returns.
+            # If BlueZ reports success but the link isn't really up (a phantom
+            # connection — typically when bluetoothd is wedged and holding stale
+            # state), treat it as a failure so the caller backs off instead of
+            # "succeeding" with a dead handle that fails every subsequent GATT op.
+            if not self.client.is_connected:
+                raise BleakError(
+                    f"phantom connection to {self.mac}: BlueZ reported success "
+                    f"but the device is not connected"
+                )
+        except BaseException:
+            # Failed or cancelled attempts can also own a D-Bus connection.
+            await self.disconnect()
+            raise
         logger.info("Connected to %s (MTU=%d)", self.mac, self.mtu_size)
 
     async def _acquire_mtu(self) -> None:
@@ -210,11 +224,22 @@ class BLEConnection:
             self._mtu_size = mtu_size
 
     async def disconnect(self) -> None:
-        """Disconnect from the BLE device."""
+        """Release the client and its D-Bus socket, including after link loss."""
         self._notify_handles.clear()
-        if self.client and self.client.is_connected:
-            logger.info("Disconnecting from %s", self.mac)
-            await self.client.disconnect()
+        client, self.client = self.client, None
+        task, self._cleanup_task = self._cleanup_task, None
+        if task is not None:
+            # The remote-disconnect callback already started this cleanup.
+            await asyncio.shield(task)
+        elif client is not None:
+            await self._disconnect_client(client)
+
+    async def _disconnect_client(self, client: BleakClient) -> None:
+        """Best-effort cleanup; report failures without masking a connect error."""
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.warning("Client cleanup failed for %s", self.mac, exc_info=True)
 
     async def get_services(self) -> list[bytes]:
         """Discover GATT services and return encoded service messages."""
@@ -704,6 +729,10 @@ class BLEManager:
 
     def _handle_disconnect(self, address: int) -> None:
         """Internal disconnect handler."""
+        # connect_device owns retries until it returns; an intermediate
+        # callback must not untrack a later successful attempt (upstream #13).
+        if address in self._connecting:
+            return
         conn = self._connections.pop(address, None)
         if conn:
             # Schedule BlueZ cleanup in background
